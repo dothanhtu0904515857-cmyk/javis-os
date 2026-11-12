@@ -681,9 +681,10 @@ class Transport:
         import zalo_audio_reply
         import zalo_personal_channel as zc
         cfg = (self.cfg_fn() if self.cfg_fn else {}) or {}
-        groups = [str(g) for g in (cfg.get("groups") or [])]
-        if groups and thread not in groups:
-            return ""           # a group the bot is not enabled in: no speech-to-text spent on it
+        # The bot's own rule for "may I talk in this group" (audience "all" allows every group, otherwise the listed
+        # ones, and a chat the owner switched off): no speech-to-text is spent on a group the bot would not answer in.
+        if chatbot_runtime._ly_do_im_co_ban(cfg, {"chat_type": "group", "chat_id": thread, "mentioned": True}):
+            return ""
         line = await chatbot_runtime.nghe_cho_bot({"audio_urls": [url]}, cfg)
         said = re.search(r'"(.+)"\)', line or "", re.S)
         if not said:
@@ -691,11 +692,13 @@ class Transport:
         names = [conn.get("label") or "", (zc._ID_MINH.get(self.conn_id) or {}).get("ten") or "", "crew"]
         names += list(((cfg.get("reply_policy") or {}).get("aliases")) or [])
         low = " " + zalo_audio_reply._strip_accents(said.group(1)) + " "
-        for n in names:
-            n = zalo_audio_reply._strip_accents(n).strip()
-            if len(n) >= 3 and re.search(r"(?<![a-z0-9])" + re.escape(n) + r"(?![a-z0-9])", low):
-                return line.strip()
-        return ""
+        named = any(len(n) >= 3 and re.search(r"(?<![a-z0-9])" + re.escape(n) + r"(?![a-z0-9])", low)
+                    for n in (zalo_audio_reply._strip_accents(x).strip() for x in names))
+        # What was said is not logged (it is a customer's speech); only whether the bot was named, so "why did it not
+        # answer my voice message" can be told from the log.
+        print(f"[zalo-personal bot {self.conn_id}] untagged group voice heard, {len(said.group(1))} chars, "
+              f"names the bot: {named}", file=sys.stderr)
+        return line.strip() if named else ""
 
     def _remember_group_voice(self, ev: dict, thread: str, url: str) -> None:
         """Keep a group voice message for `GROUP_VOICE_TTL`, per (account, group, sender); the newest replaces the older."""

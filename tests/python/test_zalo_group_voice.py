@@ -227,6 +227,10 @@ reset()
 HEARD["line"] = '(khách gửi tin thoại, máy nghe chép lại, có thể sai vài chữ: "Crew ơi")'
 asyncio.run(make_bot(dict(CFG, reply_when="mention", groups=["999"])).xu_ly(ev("audio", audio_url=URL)))
 check("CANARY: a group the bot is not enabled in costs no speech-to-text and gets no answer", not METAS, METAS)
+reset()
+asyncio.run(make_bot(dict(CFG, reply_when="mention", groups=["999"], audience="all")).xu_ly(ev("audio", audio_url=URL)))
+check("audience 'all': a group missing from the list is still heard (12/11 bug: the Tiếng Tàu group was skipped)",
+      METAS and METAS[-1][1].get("voice_heard"), METAS)
 check("split_voice: spoken part and written part", za.split_voice("Giải thích: a b.\n<voice>Nǐ hǎo 你好</voice>")
       == ("Giải thích: a b.", "Nǐ hǎo 你好"), za.split_voice("Giải thích: a b.\n<voice>Nǐ hǎo 你好</voice>"))
 check("split_voice: no tag means nothing split", za.split_voice("Dạ em chào anh ạ") == ("Dạ em chào anh ạ", ""))
