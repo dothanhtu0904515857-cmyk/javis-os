@@ -231,6 +231,21 @@ reset()
 asyncio.run(make_bot(dict(CFG, reply_when="mention", groups=["999"], audience="all")).xu_ly(ev("audio", audio_url=URL)))
 check("audience 'all': a group missing from the list is still heard (12/11 bug: the Tiếng Tàu group was skipped)",
       METAS and METAS[-1][1].get("voice_heard"), METAS)
+HEARD["line"] = '(khách gửi tin thoại, máy nghe chép lại, có thể sai vài chữ: "hôm nay trời đẹp quá")'
+reset()
+asyncio.run(make_bot(dict(CFG, reply_when="mention", groups=[GROUP], group_modes={GROUP: "always"})).xu_ly(ev("audio", audio_url=URL)))
+check("a group set to 'always': an untagged voice that does NOT name the bot still reaches the Agent, answered by voice",
+      METAS and METAS[-1][1].get("voice_heard") and SPOKEN, (METAS, SPOKEN))
+reset()
+asyncio.run(make_bot(dict(CFG, reply_when="mention", groups=[GROUP, "777"], group_modes={"777": "always"})).xu_ly(ev("audio", audio_url=URL)))
+check("CANARY: another group's mode does not leak (this group stays 'mention': unnamed voice is silent)", not METAS, METAS)
+check("group_modes: clean keeps good entries only", chatbot_store.clean_group_modes({"1": "always", "2": "x", "": "auto", "a b": "auto"}) == {"1": "always"})
+check("group_modes: a private chat never changes mode",
+      chatbot_store.with_group_mode({"reply_when": "mention", "group_modes": {"1": "always"}}, {"chat_type": "private", "chat_id": "1"})["reply_when"] == "mention")
+bid3, _e = chatbot_store.create_bot({"name": "Crew B", "agent_slug": "tro-ly", "brain": "b", "channel": "zalo_personal"})
+chatbot_store.update_bot(bid3, {"group_modes": {GROUP: "always", "x": "nope"}})
+check("group_modes: saved through update_bot, bad modes dropped", chatbot_store.get_bot(bid3).get("group_modes") == {GROUP: "always"},
+      chatbot_store.get_bot(bid3).get("group_modes"))
 check("split_voice: spoken part and written part", za.split_voice("Giải thích: a b.\n<voice>Nǐ hǎo 你好</voice>")
       == ("Giải thích: a b.", "Nǐ hǎo 你好"), za.split_voice("Giải thích: a b.\n<voice>Nǐ hǎo 你好</voice>"))
 check("split_voice: no tag means nothing split", za.split_voice("Dạ em chào anh ạ") == ("Dạ em chào anh ạ", ""))
