@@ -198,6 +198,39 @@ zc._DA_GUI_ANH.clear()
 zc.ghi_da_gui_anh(CID, GROUP, 1)
 check("echo of the bot's own mp3 (a file message) is recognised", zc._la_vong_anh(CID, GROUP) is True)
 
+# ============================================================
+# 4. Spoken name in an untagged group voice; <voice> split
+# ============================================================
+HEARD = {"line": '(khách gửi tin thoại, máy nghe chép lại, có thể sai vài chữ: "Crew ơi giải thích giúp anh chữ này")'}
+
+
+async def fake_hear(meta, cfg):
+    return HEARD["line"]
+
+
+chatbot_runtime.nghe_cho_bot = fake_hear
+t4 = make_bot(dict(CFG, reply_when="auto", groups=[GROUP]))
+reset()
+asyncio.run(t4.xu_ly(ev("audio", audio_url=URL)))
+check("auto: an untagged voice naming the bot goes on to the judge path (no tag, not forced)",
+      not METAS or (METAS[-1][1].get("mentioned") is False and METAS[-1][1].get("voice_heard")), METAS)
+reset()
+t5 = make_bot(dict(CFG, reply_when="mention", groups=[GROUP]))
+asyncio.run(t5.xu_ly(ev("audio", audio_url=URL)))
+check("mention mode: a spoken name counts as a call and is answered by voice",
+      METAS and METAS[-1][1].get("voice_heard") and SPOKEN and "giải thích giúp anh" in METAS[-1][0], (METAS, SPOKEN))
+reset()
+HEARD["line"] = '(khách gửi tin thoại, máy nghe chép lại, có thể sai vài chữ: "hôm nay trời đẹp quá")'
+asyncio.run(t5.xu_ly(ev("audio", audio_url=URL)))
+check("CANARY: an untagged voice that does not name the bot is never answered", not METAS and not TEXTS, (METAS, TEXTS))
+reset()
+HEARD["line"] = '(khách gửi tin thoại, máy nghe chép lại, có thể sai vài chữ: "Crew ơi")'
+asyncio.run(make_bot(dict(CFG, reply_when="mention", groups=["999"])).xu_ly(ev("audio", audio_url=URL)))
+check("CANARY: a group the bot is not enabled in costs no speech-to-text and gets no answer", not METAS, METAS)
+check("split_voice: spoken part and written part", za.split_voice("Giải thích: a b.\n<voice>Nǐ hǎo 你好</voice>")
+      == ("Giải thích: a b.", "Nǐ hǎo 你好"), za.split_voice("Giải thích: a b.\n<voice>Nǐ hǎo 你好</voice>"))
+check("split_voice: no tag means nothing split", za.split_voice("Dạ em chào anh ạ") == ("Dạ em chào anh ạ", ""))
+
 print()
 print("FAILED: " + ", ".join(fails) if fails else "all ok")
 sys.exit(1 if fails else 0)

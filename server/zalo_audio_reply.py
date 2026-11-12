@@ -36,6 +36,17 @@ def asks_for_voice(text: str) -> bool:
     return any(k in t for k in _VOICE_REQUESTS)
 
 
+_VOICE_BLOCK = re.compile(r"<voice>(.*?)</voice>", re.S | re.I)
+
+
+def split_voice(answer: str) -> tuple:
+    """(text to write, text to say). An answer may carry `<voice>...</voice>`: that part is spoken, the rest is written.
+    No tag: nothing is split and the whole answer is both written and spoken, as before."""
+    spoken = " ".join(" ".join(m.split()) for m in _VOICE_BLOCK.findall(str(answer or ""))).strip()
+    written = re.sub(r"\n{3,}", "\n\n", _VOICE_BLOCK.sub("", str(answer or ""))).strip()
+    return written, spoken
+
+
 def _speakable(text: str) -> str:
     """Strip markdown marks and links so the voice never reads out symbols."""
     t = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", str(text or ""))
