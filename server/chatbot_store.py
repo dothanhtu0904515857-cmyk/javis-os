@@ -75,6 +75,9 @@ KENH_NGUON_TOKEN = {k: (channels.spec(k).lay_token if channels.spec(k) else "") 
 # giá" (0.64.82): tag/reply vẫn trả lời, còn tin khác thì bot tự xem có phải câu hỏi tài liệu của
 # nó trả lời được không, xem `chatbot_tu_dong`.
 REPLY_WHEN = ("mention", "always", "auto")
+# Voice replies on personal Zalo: "audio_file" = the bot also sends its answer as a spoken mp3 (always when the customer sent
+# a voice message or asked to hear it; in private chats every answer). Restored 2026-11-12: an update had dropped this key.
+VOICE_REPLY = ("off", "audio_file")
 
 # "Bot trả lời AI" (0.64.85), khác `reply_when` (khi nào lên tiếng TRONG nhóm):
 #   "all"  - mọi cuộc chat trên kênh: chat riêng ai cũng được, mọi nhóm bot có mặt (không cần khai).
@@ -647,6 +650,7 @@ def _public(b: dict) -> dict:
     elif out["audience"] not in AUDIENCE:
         out["audience"] = AUDIENCE_HEP_NHAT
     out["people"] = _clean_groups(out.get("people"))
+    out["voice_reply"] = out.get("voice_reply") if out.get("voice_reply") in VOICE_REPLY else "off"
     # Chats the owner switched the bot off in (Chatbot v5), even though the audience would let it answer there.
     out["blocked"] = _clean_groups(out.get("blocked"))
     # Zalo labels to stay out of (0.281.0). A record from before has none: the bot answers every chat as before.
@@ -970,6 +974,7 @@ def create_bot(data: dict) -> tuple[Optional[str], str]:
             "bot_username": str(data.get("bot_username") or "").strip().lstrip("@"),
             "groups": _clean_groups(data.get("groups")),
             "reply_when": (data.get("reply_when") if data.get("reply_when") in REPLY_WHEN else "mention"),
+            "voice_reply": (data.get("voice_reply") if data.get("voice_reply") in VOICE_REPLY else "off"),
             "audience": (data.get("audience") if data.get("audience") in AUDIENCE else AUDIENCE_DEFAULT),
             "people": _clean_groups(data.get("people")),
             "reply_policy": __import__("chatbot_reply_policy").merge_config(None, data.get("reply_policy")),
@@ -1026,7 +1031,7 @@ def _nhan_brain_cho_tk(bot: dict) -> None:
 # thêm trường mới vào bản ghi mà quên loại khỏi danh sách đen là mở một đường ghi không ai ngờ.
 # `rate_limit` (trần câu trả lời mỗi người mỗi giờ) bị gỡ ở 0.85.4: bản ghi cũ còn khoá đó thì cứ để nguyên,
 # không ai đọc nó nữa, và patch gửi khoá đó tới thì bị bỏ qua như mọi khoá lạ.
-_PATCHABLE = ("name", "icon", "groups", "people", "audience", "reply_when", "handoff_to",
+_PATCHABLE = ("name", "icon", "groups", "people", "audience", "reply_when", "voice_reply", "handoff_to",
               "agent_slug", "agent_brain", "brain", "bot_username", "token", "enabled",
               "nguon_tra_loi", "muc_quyen", "ngon_ngu", "account_ids", "reply_policy", "gio_truc",
               "nhuong_tay_phut", "ngoai_le", "nhan_ket_ban", "skip_labels", "blocked",
@@ -1105,6 +1110,9 @@ def update_bot(bot_id: str, patch: dict) -> tuple[bool, str]:
                 elif k == "reply_when":
                     if v in REPLY_WHEN:
                         b["reply_when"] = v
+                elif k == "voice_reply":
+                    if v in VOICE_REPLY:
+                        b["voice_reply"] = v
                 elif k == "reply_policy":
                     # Gộp từng khoá, giá trị lạ giữ nguyên giá trị cũ (xem `merge_config`).
                     b["reply_policy"] = __import__("chatbot_reply_policy").merge_config(b.get("reply_policy"), v)

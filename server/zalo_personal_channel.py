@@ -914,7 +914,7 @@ def _ghi_lo(conn: dict, tin: list, ten: dict) -> tuple:
             # Hộp thư, ghi thêm lần nữa là hiện hai lần, lần hai mang nhãn "người thật"). Còn
             # lại là chủ tự tay nhắn: nhớ giờ để bot nhường cuộc chat đó.
             if _la_tieng_vong(conn["id"], ev["external_chat_id"], ev["text"]) or (
-                    ev.get("message_type") == "image"
+                    ev.get("message_type") in ("image", "file")       # bot's voice reply goes out as an mp3 file
                     and _la_vong_anh(conn["id"], ev["external_chat_id"])):
                 attach_echo_id(conn["id"], ev)
                 trung += 1
