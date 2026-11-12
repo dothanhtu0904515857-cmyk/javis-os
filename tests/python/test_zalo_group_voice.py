@@ -163,8 +163,17 @@ check("a bad value is ignored", chatbot_store.get_bot(bid).get("voice_reply") ==
 check("an old record reads as off", chatbot_store._public({"id": "x"}).get("voice_reply") == "off")
 
 segs = za._segments("Dạ anh, chữ 早上好 đọc là zǎoshang hǎo ạ.")
-check("Chinese runs are split out for the Chinese voice", [s for s in segs if s[1]] == [("早上好", True)] and len(segs) == 3, segs)
-check("pure Vietnamese stays one piece", za._segments("Dạ anh Đức") == [("Dạ anh Đức", False)])
+check("Chinese runs go to the simplified Chinese voice", ("早上好", "zh-CN") in segs, segs)
+check("CANARY: pinyin next to its Hanzi is not read by the Vietnamese voice",
+      not any("zǎoshang" in t or "hǎo" in t for t, _l in segs), segs)
+check("the Vietnamese around it stays Vietnamese", segs[0] == ("Dạ anh, chữ", "vi") and segs[-1][1] == "vi", segs)
+check("pure Vietnamese stays one piece", za._segments("Dạ anh Đức") == [("Dạ anh Đức", "vi")])
+check("traditional characters go to the Taiwan voice", za._segments("駕駛臺")[0] == ("駕駛臺", "zh-TW"), za._segments("駕駛臺"))
+tri = za._segments("Buồng lái là nơi điều khiển tàu. The bridge is the control room of the ship. 驾驶台")
+check("an English sentence gets the English voice", [l for _t, l in tri] == ["vi", "en", "zh-CN"], tri)
+check("pinyin without Hanzi is kept (nothing else would say it)", "hǎo" in za._segments("đọc là nǐ hǎo nhé")[0][0])
+check("Vietnamese words with acute/grave are never taken for pinyin",
+      za._segments("Dạ 好 là tốt, má và bà đều khỏe ạ.")[-1][0].count("má") == 1, za._segments("Dạ 好 là tốt, má và bà đều khỏe ạ."))
 
 SENT_FILES = []
 
