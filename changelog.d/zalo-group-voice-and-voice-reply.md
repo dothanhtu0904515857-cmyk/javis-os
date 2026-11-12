@@ -9,6 +9,7 @@ title: Zalo bot hears voice messages in groups and can answer by voice
 
 ### Sửa lỗi
 - **Công tắc trả lời bằng giọng nói của bot Zalo hoạt động trở lại.** Cài đặt này từng bị mất sau một lần cập nhật.
+- **Người được nâng quyền ở chat riêng giữ đúng quyền đó khi ra lệnh trong nhóm.** Trước đây chủ ra lệnh gửi tin hay đặt lịch trong nhóm thì bot chạy ở mức quyền thấp của bot nên bị chặn.
 
 ## en
 ### Added
@@ -17,3 +18,4 @@ title: Zalo bot hears voice messages in groups and can answer by voice
 
 ### Fixed
 - **The Zalo bot's voice reply switch works again.** The setting had been lost in an update.
+- **A person raised in their private chat keeps that level when giving orders in a group.** The owner's order to send a message or set a reminder from a group used to run at the bot's own lower level and was blocked.

@@ -154,6 +154,14 @@ check("another private chat keeps the bot's level",
       chatbot_store.ap_ngoai_le(cfg, dict(rieng, chat_id="u_ph1")) is cfg)
 check("a GROUP with the same id is never an exception",
       chatbot_store.ap_ngoai_le(cfg, dict(rieng, chat_type="group")) is cfg)
+# 2026-11-12: the exception follows the PERSON into groups (the owner's orders in a group ran at the bot's own level).
+group_me = {"chat_id": "g-777", "chat_type": "group", "account_id": ACC, "user_id": "u_me"}
+check("a group turn SENT BY the excepted person runs at her level",
+      chatbot_store.ap_ngoai_le(cfg, group_me)["muc_quyen"] == "full")
+check("CANARY: anyone else in that group keeps the bot's level",
+      chatbot_store.ap_ngoai_le(cfg, dict(group_me, user_id="u_ph1")) is cfg)
+check("CANARY: her id as a group sender on ANOTHER account is never an exception",
+      chatbot_store.ap_ngoai_le(cfg, dict(group_me, account_id="tg-acc-1")) is cfg)
 check("CANARY: the same id on ANOTHER account (e.g. the bot's Telegram) is never an exception",
       chatbot_store.ap_ngoai_le(cfg, dict(rieng, account_id="tg-acc-1")) is cfg)
 check("a turn with no account is never an exception",

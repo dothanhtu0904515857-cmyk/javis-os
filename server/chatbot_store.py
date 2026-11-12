@@ -464,12 +464,18 @@ def can_xac_nhan_ngoai_le(moi: list, cu: Any, xac_nhan: Any) -> bool:
 
 
 def ngoai_le_cua(cfg: dict, meta: Optional[dict]) -> Optional[dict]:
-    """The exception that applies to this turn, or None. Private chats only, and only on the channel account the
-    exception names: both `chat_id` and `account_id` of the turn must match exactly."""
+    """The exception that applies to this turn, or None. Only on the channel account the exception names.
+
+    Private chat: `chat_id` and `account_id` of the turn must match exactly. Group (2026-11-12): the exception follows
+    the PERSON. An exception names a private chat, whose id is that person's own id on the channel, so a group turn
+    whose SENDER (`user_id`, set by the channel from the message, never from its text) is that person runs at the
+    exception's level too. Before this the owner's private chat was "full" but the same owner giving an order in a
+    group ran at the bot's own level, and sends or reminders ordered there were blocked."""
     m = meta or {}
-    if str(m.get("chat_type") or "") != "private":
+    kind = str(m.get("chat_type") or "")
+    if kind not in ("private", "group"):
         return None
-    cid = str(m.get("chat_id") or "").strip()
+    cid = str((m.get("chat_id") if kind == "private" else m.get("user_id")) or "").strip()
     aid = str(m.get("account_id") or "").strip()
     if not cid or not aid:
         return None
