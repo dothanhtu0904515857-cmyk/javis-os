@@ -638,9 +638,14 @@ class Transport:
             await asyncio.sleep(10)
 
     # ---- một tin khách ---------------------------------------------------------------
-    def _che_do_nhom(self) -> str:
+    def _che_do_nhom(self, thread: str = "") -> str:
+        """The bot's reply mode in a group: the group's own mode (`group_modes`) when the owner set one, else the bot's."""
         try:
-            return str((self.cfg_fn() if self.cfg_fn else {}).get("reply_when") or "")
+            import chatbot_store
+            cfg = (self.cfg_fn() if self.cfg_fn else {}) or {}
+            if thread:
+                cfg = chatbot_store.with_group_mode(cfg, {"chat_type": "group", "chat_id": thread})
+            return str(cfg.get("reply_when") or "")
         except Exception:
             return ""
 
@@ -673,9 +678,10 @@ class Transport:
         except Exception as e:      # noqa: BLE001 - nhớ ảnh hỏng không được làm sập vòng đọc tin
             print(f"[zalo-personal bot {self.conn_id}] nhớ ảnh trơn lỗi: {type(e).__name__}: {e}", file=sys.stderr)
 
-    async def _hear_group_voice(self, thread: str, url: str, conn: dict) -> str:
-        """The words of an untagged group voice message as a line for the model, or "" when it cannot be heard or does not
-        name the bot (by its connection label, learned display name or the bot's reply-policy aliases)."""
+    async def _hear_group_voice(self, thread: str, url: str, conn: dict) -> tuple:
+        """(line for the model, names the bot) of an untagged group voice message; ("", False) when it cannot be heard or
+        the bot may not talk in the group. The bot is named by its connection label, learned display name or the
+        reply-policy aliases."""
         import re
         import chatbot_runtime
         import zalo_audio_reply
@@ -684,11 +690,11 @@ class Transport:
         # The bot's own rule for "may I talk in this group" (audience "all" allows every group, otherwise the listed
         # ones, and a chat the owner switched off): no speech-to-text is spent on a group the bot would not answer in.
         if chatbot_runtime._ly_do_im_co_ban(cfg, {"chat_type": "group", "chat_id": thread, "mentioned": True}):
-            return ""
+            return "", False
         line = await chatbot_runtime.nghe_cho_bot({"audio_urls": [url]}, cfg)
         said = re.search(r'"(.+)"\)', line or "", re.S)
         if not said:
-            return ""
+            return "", False
         names = [conn.get("label") or "", (zc._ID_MINH.get(self.conn_id) or {}).get("ten") or "", "crew"]
         names += list(((cfg.get("reply_policy") or {}).get("aliases")) or [])
         low = " " + zalo_audio_reply._strip_accents(said.group(1)) + " "
@@ -698,7 +704,7 @@ class Transport:
         # answer my voice message" can be told from the log.
         print(f"[zalo-personal bot {self.conn_id}] untagged group voice heard, {len(said.group(1))} chars, "
               f"names the bot: {named}", file=sys.stderr)
-        return line.strip() if named else ""
+        return line.strip(), named
 
     def _remember_group_voice(self, ev: dict, thread: str, url: str) -> None:
         """Keep a group voice message for `GROUP_VOICE_TTL`, per (account, group, sender); the newest replaces the older."""
@@ -870,9 +876,12 @@ class Transport:
                         # call, like two people talking by voice). Whether to answer is then decided like for any group
                         # text (the reply judge in "auto"); a real tag or reply is always answered. Kept in any case for
                         # the person's next call.
-                        heard = await self._hear_group_voice(thread, audio_urls[0], conn_g)
+                        heard, named = await self._hear_group_voice(thread, audio_urls[0], conn_g)
                         if not heard:
                             return
+                        if not named and self._che_do_nhom(thread) == "mention":
+                            return          # "mention" mode: only a spoken name calls the bot
+                        # In a group the owner set to "always" or "auto" the bot decides for itself, named or not.
                         text = heard
                         audio_urls = []
                         voice_heard = True
@@ -1008,13 +1017,13 @@ class Transport:
             if voice_heard and not (tag or rep):
                 # A spoken name is not a tag. In "auto" the judge decides (answer or stay silent); in the other modes
                 # a spoken name counts as a call, as a typed name does.
-                duoc_goi = self._che_do_nhom() != "auto"
+                duoc_goi = self._che_do_nhom(thread) != "auto"
                 meta["mentioned"] = duoc_goi
         if nhom and not vao_nhom and not is_reaction:
             # Files in a group (0.336.0, see `zc.remember_bare_file`): a file nobody addressed to the bot waits for its
             # sender's next call; a call that quotes a file, or comes right after the sender's bare file, gets it.
             nguoi = str(ev.get("sender_id") or "")
-            if chi_file and files and not duoc_goi and self._che_do_nhom() != "always":
+            if chi_file and files and not duoc_goi and self._che_do_nhom(thread) != "always":
                 zc.remember_bare_file(self.conn_id, thread, nguoi, files[0], float(ev.get("created_at") or 0))
             elif (duoc_goi and not files and nguoi and ev.get("sender_type") == "customer" and self.precheck_fn
                   and str(ev.get("account_id") or "") == self.conn_id):
@@ -1029,9 +1038,9 @@ class Transport:
                     if cau and not nhom:
                         await self._gui(thread, cau, "private")
                     return
-            if chi_file and nhom and not duoc_goi and self._che_do_nhom() != "always":
+            if chi_file and nhom and not duoc_goi and self._che_do_nhom(thread) != "always":
                 return  # file thả vào nhóm mà không ai gọi bot: không tải, không đưa qua bộ phán xử
-            if nhom and not duoc_goi and self._che_do_nhom() == "auto":
+            if nhom and not duoc_goi and self._che_do_nhom(thread) == "auto":
                 if pol and pol.get("mode") == "on":
                     # Bộ phán xử thay cửa từ khoá: tin hiển nhiên không đáng đã được ghi vết và bỏ ở `prepare`.
                     if pol.get("action") == "drop":
