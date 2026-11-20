@@ -157,6 +157,10 @@ _WORKER_SCRIPT = (
     "ref = sys.argv[1]\n"
     "from vieneu import Vieneu\n"
     "v = Vieneu(mode='v3turbo') if ref else Vieneu(precision='int8')\n"
+    "try:\n"        # the FIRST sentence is slow (measured 22 s against 4-5 s for the next ones): pay it here, not in chat
+    "    v.infer('Xin chào.', ref_audio=ref) if ref else v.infer('Xin chào.', voice=sys.argv[2])\n"
+    "except Exception:\n"
+    "    pass\n"
     "def say(d):\n"
     f"    proto.write({_MARK!r} + json.dumps(d) + '\\n'); proto.flush()\n"
     "say({'ready': True})\n"
@@ -216,7 +220,7 @@ async def _worker() -> Optional[object]:
         pass
     t0 = asyncio.get_running_loop().time()
     try:
-        p = await asyncio.create_subprocess_exec(sys.executable, "-c", _WORKER_SCRIPT, key, env=env,
+        p = await asyncio.create_subprocess_exec(sys.executable, "-c", _WORKER_SCRIPT, key, VIENEU_VOICE, env=env,
                                                  stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                                                  stderr=log or asyncio.subprocess.DEVNULL)
         _W.update(proc=p, ref=key)
