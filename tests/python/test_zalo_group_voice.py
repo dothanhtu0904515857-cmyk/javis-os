@@ -106,7 +106,31 @@ asyncio.run(t.xu_ly(ev("text", text="@Crew nhận xét e ơi")))
 check("the tagged text that follows carries the voice link", METAS and METAS[-1][1].get("audio_urls") == [URL], METAS)
 check("the voice is used up", (CID, GROUP, LAN) not in zp._GROUP_VOICE)
 check("an answer to a voice message is spoken (even in a group)", SPOKEN and SPOKEN[-1][1] == "Dạ em nghe rồi ạ", SPOKEN)
-check("the text answer goes out too", TEXTS == ["Dạ em nghe rồi ạ"], TEXTS)
+check("the voice IS the answer: no duplicate text", TEXTS == [], TEXTS)
+
+# a voice that cannot be made or sent: the written answer goes out instead, nothing is lost
+reset()
+CALL["tag"] = True
+asyncio.run(t.xu_ly(ev("audio", audio_url=URL)))
+async def voice_fails(thread, cau, chat_type="private"):
+    return False
+real_voice = t._send_voice
+t._send_voice = voice_fails
+asyncio.run(t.xu_ly(ev("text", text="@Crew nhận xét e ơi")))
+check("voice failed: the text answer goes out", TEXTS == ["Dạ em nghe rồi ạ"], TEXTS)
+t._send_voice = real_voice
+
+# a reply that quotes a voice message is answered by voice, even when the voice itself cannot be heard again
+reset()
+CALL["tag"] = True
+asyncio.run(t.xu_ly(ev("text", text="@Crew", replyTo={"senderName": "Crewvn", "text": "[Tin nhắn thoại]"})))
+check("quoting a voice message flags the turn", METAS and METAS[-1][1].get("quote_voice"), METAS)
+check("and it is answered by voice only", SPOKEN and TEXTS == [], (SPOKEN, TEXTS))
+reset()
+CALL["tag"] = True
+asyncio.run(t.xu_ly(ev("text", text="@Crew", replyTo={"senderName": "Crewvn", "text": "giá bao nhiêu"})))
+check("quoting a plain text message does not", METAS and not METAS[-1][1].get("quote_voice") and not SPOKEN, METAS)
+reset()
 
 METAS.clear(); SPOKEN.clear()
 asyncio.run(t.xu_ly(ev("text", text="@Crew cảm ơn")))

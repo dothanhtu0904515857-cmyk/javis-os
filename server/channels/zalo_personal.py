@@ -1055,6 +1055,16 @@ class Transport:
             gio, url, mid = zc.recent_private_video(self.conn_id, thread)
             meta.update(video_url=url, video_msg=mid,
                         video_truoc=datetime.fromtimestamp(gio, localefmt.tz()).strftime("%H:%M"))
+        if not vao_nhom and not is_reaction:
+            # A reply that quotes a VOICE message ("@bot" under someone's voice) is a spoken exchange: the bot answers by
+            # voice, whether or not that voice message could be heard again.
+            rt_q = md0.get("replyTo")
+            if isinstance(rt_q, dict):
+                import zalo_audio_reply
+                quoted = zalo_audio_reply._strip_accents(" ".join(
+                    str(rt_q.get(k) or "") for k in ("text", "msg", "content", "title", "type", "msgType")))
+                if re.search(r"tin nhan thoai|\bvoice\b|\baudio\b", quoted):
+                    meta["quote_voice"] = True
         duoc_goi = False
         pol = None
         if vao_nhom:
@@ -1194,22 +1204,33 @@ class Transport:
                     want_voice = self._wants_voice(meta, text)
                     if spoken and not want_voice:
                         cau, spoken = (cau + "\n\n" + spoken).strip(), ""
+                    # A spoken question gets a SPOKEN answer, and only that when it fits in one recording: the voice goes
+                    # first and the text is sent only if the voice could not be made or sent (never lose the answer).
+                    # A long answer (past the recording limit) keeps the old order: text, then its voice.
+                    solo_voice = bool(want_voice and cau and not spoken
+                                      and len(zalo_audio_reply._speakable(cau)) <= zalo_audio_reply.MAX_CHARS)
                     if (cau or anh or spoken) and zc._BOTS.get(self.conn_id) is self:
                         sent = None
-                        if cau:
-                            sent = await self._gui(thread, cau, loai, meta, receipt_row=receipt_row)
-                        if (cau or spoken) and want_voice:
+                        ok_voice = None
+                        if want_voice and (spoken or solo_voice):
                             ok_voice = await self._send_voice(thread, spoken or cau, loai)
-                            if spoken and not cau:
-                                self._set_delivery(receipt_row, "accepted" if ok_voice else "failed")
+                            if not ok_voice and not cau:
+                                cau = spoken        # the voice failed: what was meant to be said is written instead
+                        if cau and not (solo_voice and ok_voice):
+                            sent = await self._gui(thread, cau, loai, meta, receipt_row=receipt_row)
+                        elif ok_voice and not anh:
+                            sent = True
+                            self._set_delivery(receipt_row, "accepted")
+                        if want_voice and cau and not spoken and not solo_voice:
+                            await self._send_voice(thread, cau, loai)
                         if anh:
                             image_sent = await self._gui_anh(thread, anh, loai)
                             if not cau and image_sent:
                                 self._set_delivery(receipt_row, "accepted")
                             elif not cau:
                                 self._set_delivery(receipt_row, "unknown", reason="image_unconfirmed")
-                        if cau and nhom and self.policy is not None and sent is not False:
-                            self.policy.replied(meta, cau)
+                        if (cau or ok_voice) and nhom and self.policy is not None and sent is not False:
+                            self.policy.replied(meta, cau or spoken)
                     elif receipt_row:
                         self._set_delivery(receipt_row, "cancelled", reason="bot_stopped")
                 finally:
@@ -1280,7 +1301,7 @@ class Transport:
         a voice); otherwise only for a bot with `voice_reply: audio_file`: every answer in a private chat, and in a group
         only when the asker asks to hear it (`zalo_audio_reply.asks_for_voice`), so a group is not flooded with files."""
         import zalo_audio_reply
-        if (meta or {}).get("audio_urls") or (meta or {}).get("voice_heard"):
+        if (meta or {}).get("audio_urls") or (meta or {}).get("voice_heard") or (meta or {}).get("quote_voice"):
             return True
         cfg = (self.cfg_fn() if self.cfg_fn else {}) or {}
         if cfg.get("voice_reply") != "audio_file":
@@ -1295,6 +1316,11 @@ class Transport:
         # Remember BEFORE sending, like images: the mp3 comes back in the read loop as the account's own file message.
         zc.ghi_da_gui_anh(self.conn_id, thread, 1)
         ok, loi = await zalo_audio_reply.send_audio_file(conn, thread, chat_type, cau)
+        if not ok and not send_uncertain(loi):
+            # One more try: the voice engine or the upload can fail once (cold model, busy server). A send that may have
+            # gone out (timeout) is NOT repeated, so the group never gets the recording twice.
+            zc.ghi_da_gui_anh(self.conn_id, thread, 1)
+            ok, loi = await zalo_audio_reply.send_audio_file(conn, thread, chat_type, cau)
         if not ok:
             self.last_error = localefmt.chu(f"Gửi tin thoại Zalo lỗi: {loi}", f"Zalo voice reply failed: {loi}")[:300]
             print(f"[zalo-personal bot {self.conn_id}] {self.last_error}", file=sys.stderr)
