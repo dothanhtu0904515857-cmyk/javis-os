@@ -1,0 +1,63 @@
+diff --git a/server/channels/zalo_personal.py b/server/channels/zalo_personal.py
+index 09038fbb..376bd7d5 100644
+--- a/server/channels/zalo_personal.py
++++ b/server/channels/zalo_personal.py
+@@ -779,6 +779,18 @@ class Transport:
+               f"names the bot: {named}", file=sys.stderr)
+         return line.strip(), named
+ 
++    def _dbg(self, why: str, ev: dict, meta: dict = None) -> None:
++        """One log line saying why a GROUP message that may have been meant for the bot got no answer. Never the text."""
++        try:
++            if (ev or {}).get("chat_type") != "group" or (ev or {}).get("message_type") not in ("text", "audio"):
++                return
++            m = meta or {}
++            print(f"[zalo-personal bot {self.conn_id}] tin nhóm …{str((ev or {}).get('external_chat_id') or '')[-6:]} "
++                  f"không được trả lời: {why} (loại={ev.get('message_type')}, tag={m.get('mentioned')}, "
++                  f"reply={m.get('reply_to_bot')}, thoại={bool(m.get('audio_urls'))})", file=sys.stderr)
++        except Exception:       # noqa: BLE001 - a log line must never cost the turn
++            pass
++
+     def _remember_group_voice(self, ev: dict, thread: str, url: str) -> None:
+         """Keep a group voice message for `GROUP_VOICE_TTL`, per (account, group, sender); the newest replaces the older."""
+         import zalo_personal_channel as zc
+@@ -983,6 +995,7 @@ class Transport:
+         # message; in groups this happens only when the bot's yield time was saved explicitly (`zc.yield_explicit`).
+         sau_chu_im = bool((ev.get("metadata") or {}).get("sau_chu_im"))
+         if time.time() - float(ev.get("created_at") or 0) > zc.TUOI_TOI_DA and not sau_chu_im:
++            self._dbg("tin_qua_cu", ev)
+             return
+         # With a 0-minute yield the bot does not go quiet, but a private message the owner has already answered by
+         # hand is not answered again under the owner's name (held turns are filtered the same way in `xa_cho_chu`).
+@@ -994,6 +1007,7 @@ class Transport:
+         # dưới. A bot without the setting keeps the old group rule: silent for the whole window.
+         chu_nhuong = zc.chu_vua_nhan_tay(self.conn_id, thread)
+         if chu_nhuong and (not nhom or not zc.yield_explicit(self.conn_id)):
++            self._dbg("chu_vua_nhan_tay", ev)
+             return
+         meta = {
+             "chat_id": thread, "chat_type": "group" if nhom else "private",
+@@ -1117,6 +1131,7 @@ class Transport:
+                 if asyncio.iscoroutine(r):
+                     r = await r
+                 if r is not None:           # {} = im, {"reply": ...} = một câu cố định
++                    self._dbg("precheck_im", ev, meta)
+                     cau = str((r or {}).get("reply") or "").strip()
+                     if cau and not nhom:
+                         await self._gui(thread, cau, "private")
+diff --git a/server/chatbot_runtime.py b/server/chatbot_runtime.py
+index 82e192dc..e2c555c0 100644
+--- a/server/chatbot_runtime.py
++++ b/server/chatbot_runtime.py
+@@ -1475,6 +1475,11 @@ def _make_precheck_fn(bot_id: str):
+         if (meta or {}).get("member_join"):
+             # A join in a group the bot may not speak in: silent, and not a "call" for the approval queue.
+             return {}
++        if ly_do != "khong_goi_ten":
++            # Silence the owner may need to explain ("why did the bot not answer"): the code is logged, never the
++            # message. "khong_goi_ten" is normal group chatter and would flood the log.
++            print(f"[chatbot {bot_id}] im lặng ở {(meta or {}).get('chat_type') or 'private'} "
++                  f"…{str((meta or {}).get('chat_id') or '')[-6:]}: {ly_do}", file=sys.stderr)
+         if ly_do in ("ngoai_gio_truc", "chat_tat"):
+             # Outside active hours, or the owner switched the bot off in this chat (Chatbot v5): silent, nothing sent. A message the bot WOULD have answered still goes to the
+             # inbox so whoever is on duty reads it in the morning; group chatter in "Tự đánh giá" mode does not,

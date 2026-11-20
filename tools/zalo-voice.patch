@@ -1,0 +1,1975 @@
+diff --git a/server/channels/zalo_personal.py b/server/channels/zalo_personal.py
+index f9c7d961..376bd7d5 100644
+--- a/server/channels/zalo_personal.py
++++ b/server/channels/zalo_personal.py
+@@ -584,6 +584,10 @@ async def send_reaction(tk: dict, chat_id: str, msg_id: str, name: str, chat_typ
+     return True, ""
+ 
+ 
++GROUP_VOICE_TTL = 900       # a group voice message stays "the one they mean" this long (same as photos, ANH_CHO_GIAY)
++_GROUP_VOICE: dict = {}      # (account, group, sender) -> (voice link, time)
++
++
+ async def gui_anh(tk: dict, chat_id: str, paths, chat_type: str = "private"):
+     """Send images the bot asked for (0.84.3), after its text. `(ok, error)`.
+ 
+@@ -707,9 +711,14 @@ class Transport:
+             await asyncio.sleep(10)
+ 
+     # ---- một tin khách ---------------------------------------------------------------
+-    def _che_do_nhom(self) -> str:
++    def _che_do_nhom(self, thread: str = "") -> str:
++        """The bot's reply mode in a group: the group's own mode (`group_modes`) when the owner set one, else the bot's."""
+         try:
+-            return str((self.cfg_fn() if self.cfg_fn else {}).get("reply_when") or "")
++            import chatbot_store
++            cfg = (self.cfg_fn() if self.cfg_fn else {}) or {}
++            if thread:
++                cfg = chatbot_store.with_group_mode(cfg, {"chat_type": "group", "chat_id": thread})
++            return str(cfg.get("reply_when") or "")
+         except Exception:
+             return ""
+ 
+@@ -742,6 +751,64 @@ class Transport:
+         except Exception as e:      # noqa: BLE001 - nhớ ảnh hỏng không được làm sập vòng đọc tin
+             print(f"[zalo-personal bot {self.conn_id}] nhớ ảnh trơn lỗi: {type(e).__name__}: {e}", file=sys.stderr)
+ 
++    async def _hear_group_voice(self, thread: str, url: str, conn: dict) -> tuple:
++        """(line for the model, names the bot) of an untagged group voice message; ("", False) when it cannot be heard or
++        the bot may not talk in the group. The bot is named by its connection label, learned display name or the
++        reply-policy aliases."""
++        import re
++        import chatbot_runtime
++        import zalo_audio_reply
++        import zalo_personal_channel as zc
++        cfg = (self.cfg_fn() if self.cfg_fn else {}) or {}
++        # The bot's own rule for "may I talk in this group" (audience "all" allows every group, otherwise the listed
++        # ones, and a chat the owner switched off): no speech-to-text is spent on a group the bot would not answer in.
++        if chatbot_runtime._ly_do_im_co_ban(cfg, {"chat_type": "group", "chat_id": thread, "mentioned": True}):
++            return "", False
++        line = await chatbot_runtime.nghe_cho_bot({"audio_urls": [url]}, cfg)
++        said = re.search(r'"(.+)"\)', line or "", re.S)
++        if not said:
++            return "", False
++        names = [conn.get("label") or "", (zc._ID_MINH.get(self.conn_id) or {}).get("ten") or "", "crew"]
++        names += list(((cfg.get("reply_policy") or {}).get("aliases")) or [])
++        low = " " + zalo_audio_reply._strip_accents(said.group(1)) + " "
++        named = any(len(n) >= 3 and re.search(r"(?<![a-z0-9])" + re.escape(n) + r"(?![a-z0-9])", low)
++                    for n in (zalo_audio_reply._strip_accents(x).strip() for x in names))
++        # What was said is not logged (it is a customer's speech); only whether the bot was named, so "why did it not
++        # answer my voice message" can be told from the log.
++        print(f"[zalo-personal bot {self.conn_id}] untagged group voice heard, {len(said.group(1))} chars, "
++              f"names the bot: {named}", file=sys.stderr)
++        return line.strip(), named
++
++    def _dbg(self, why: str, ev: dict, meta: dict = None) -> None:
++        """One log line saying why a GROUP message that may have been meant for the bot got no answer. Never the text."""
++        try:
++            if (ev or {}).get("chat_type") != "group" or (ev or {}).get("message_type") not in ("text", "audio"):
++                return
++            m = meta or {}
++            print(f"[zalo-personal bot {self.conn_id}] tin nhóm …{str((ev or {}).get('external_chat_id') or '')[-6:]} "
++                  f"không được trả lời: {why} (loại={ev.get('message_type')}, tag={m.get('mentioned')}, "
++                  f"reply={m.get('reply_to_bot')}, thoại={bool(m.get('audio_urls'))})", file=sys.stderr)
++        except Exception:       # noqa: BLE001 - a log line must never cost the turn
++            pass
++
++    def _remember_group_voice(self, ev: dict, thread: str, url: str) -> None:
++        """Keep a group voice message for `GROUP_VOICE_TTL`, per (account, group, sender); the newest replaces the older."""
++        import zalo_personal_channel as zc
++        nguoi = str(ev.get("sender_id") or "")
++        minh = (zc._ID_MINH.get(self.conn_id) or {}).get("uid")
++        if not nguoi or not url or (minh and nguoi == minh):
++            return
++        now = time.time()
++        if len(_GROUP_VOICE) > 300:
++            for k in [k for k, v in _GROUP_VOICE.items() if now - v[1] > GROUP_VOICE_TTL]:
++                _GROUP_VOICE.pop(k, None)
++        _GROUP_VOICE[(self.conn_id, thread, nguoi)] = (url, now)
++
++    def _take_group_voice(self, ev: dict, thread: str) -> str:
++        """The voice link `_remember_group_voice` kept for this sender if still fresh; taken once. "" otherwise."""
++        v = _GROUP_VOICE.pop((self.conn_id, thread, str(ev.get("sender_id") or "")), None)
++        return v[0] if v and time.time() - v[1] <= GROUP_VOICE_TTL else ""
++
+     async def _tai_file(self, files: list, text: str, meta: dict, thread: str, chi_file: bool) -> tuple:
+         """Tải các file khách gửi về `inbox/khach` của brain bot, rồi gắn dấu file vào lượt.
+ 
+@@ -849,8 +916,12 @@ class Transport:
+         # 0.433.0: a video the customer sent in this private turn; the bot looks at its frames (`chatbot_runtime`).
+         video_url = str(md0.get("video_url") or "") if loai == "private" and not vao_nhom else ""
+         # 0.435.0: voice messages of this private turn (a merged turn carries a list, a single message its own link).
+-        audio_urls = ([] if loai != "private" or vao_nhom
+-                      else list(md0.get("audio_urls") or []) if md0.get("gop")
++        # Groups too (2026-11-12): the crew trains pronunciation by voice in a group ("Nhóm tiếng Tàu"); until now a group voice
++        # message was dropped, so the bot answered "em nghe chưa được". A bare group voice is remembered (`_remember_group_voice`)
++        # for the same person's next message that calls the bot; one that replies to the bot is answered at once.
++        voice_heard = False         # an untagged group voice that was heard here and names the bot (`_hear_group_voice`)
++        audio_urls = ([] if vao_nhom
++                      else list(md0.get("audio_urls") or []) if md0.get("gop") and loai == "private"
+                       else [md0["audio_url"]] if kieu == "audio" and md0.get("audio_url") else [])
+         if vao_nhom:
+             # 0.84.2: someone joined the group. The newcomer is the "sender", so a reply tags them (`_gui`).
+@@ -881,7 +952,26 @@ class Transport:
+             # ở đây, nên bot không bao giờ thấy ảnh gửi trơn (15/10/2026). Đưa cho bot kèm ảnh, Agent tự quyết hỏi gì.
+             if audio_urls and not co_anh and not video_url:
+                 import chatbot_runtime
+-                text = chatbot_runtime.AUDIO_TRON
++                if nhom:
++                    self._remember_group_voice(ev, thread, audio_urls[0])
++                    conn_g = zc.ket_noi_theo_id(self.conn_id) or {}
++                    tag_g, rep_g = zc.nhan_dien_goi(self.conn_id, ev, (conn_g.get("label") or "",))
++                    if not (tag_g or rep_g):
++                        # An untagged voice in a group: hear it, and only go on when the speaker NAMES the bot (a spoken
++                        # call, like two people talking by voice). Whether to answer is then decided like for any group
++                        # text (the reply judge in "auto"); a real tag or reply is always answered. Kept in any case for
++                        # the person's next call.
++                        heard, named = await self._hear_group_voice(thread, audio_urls[0], conn_g)
++                        if not heard:
++                            return
++                        if not named and self._che_do_nhom(thread) == "mention":
++                            return          # "mention" mode: only a spoken name calls the bot
++                        # In a group the owner set to "always" or "auto" the bot decides for itself, named or not.
++                        text = heard
++                        audio_urls = []
++                        voice_heard = True
++                if not text:
++                    text = chatbot_runtime.AUDIO_TRON
+             elif video_url and not co_anh:
+                 import chatbot_runtime
+                 text = chatbot_runtime.VIDEO_TRON
+@@ -905,6 +995,7 @@ class Transport:
+         # message; in groups this happens only when the bot's yield time was saved explicitly (`zc.yield_explicit`).
+         sau_chu_im = bool((ev.get("metadata") or {}).get("sau_chu_im"))
+         if time.time() - float(ev.get("created_at") or 0) > zc.TUOI_TOI_DA and not sau_chu_im:
++            self._dbg("tin_qua_cu", ev)
+             return
+         # With a 0-minute yield the bot does not go quiet, but a private message the owner has already answered by
+         # hand is not answered again under the owner's name (held turns are filtered the same way in `xa_cho_chu`).
+@@ -916,6 +1007,7 @@ class Transport:
+         # dưới. A bot without the setting keeps the old group rule: silent for the whole window.
+         chu_nhuong = zc.chu_vua_nhan_tay(self.conn_id, thread)
+         if chu_nhuong and (not nhom or not zc.yield_explicit(self.conn_id)):
++            self._dbg("chu_vua_nhan_tay", ev)
+             return
+         meta = {
+             "chat_id": thread, "chat_type": "group" if nhom else "private",
+@@ -965,6 +1057,8 @@ class Transport:
+                         + " trong cuộc chat này, có thể liên quan tới tin trên]")
+         if audio_urls:
+             meta["audio_urls"] = audio_urls
++        if voice_heard:
++            meta["voice_heard"] = True
+         if video_url:
+             meta["video_url"] = video_url
+             meta["video_msg"] = str(md0.get("video_msg") or ev.get("external_message_id") or "")
+@@ -975,6 +1069,16 @@ class Transport:
+             gio, url, mid = zc.recent_private_video(self.conn_id, thread)
+             meta.update(video_url=url, video_msg=mid,
+                         video_truoc=datetime.fromtimestamp(gio, localefmt.tz()).strftime("%H:%M"))
++        if not vao_nhom and not is_reaction:
++            # A reply that quotes a VOICE message ("@bot" under someone's voice) is a spoken exchange: the bot answers by
++            # voice, whether or not that voice message could be heard again.
++            rt_q = md0.get("replyTo")
++            if isinstance(rt_q, dict):
++                import zalo_audio_reply
++                quoted = zalo_audio_reply._strip_accents(" ".join(
++                    str(rt_q.get(k) or "") for k in ("text", "msg", "content", "title", "type", "msgType")))
++                if re.search(r"tin nhan thoai|\bvoice\b|\baudio\b", quoted):
++                    meta["quote_voice"] = True
+         duoc_goi = False
+         pol = None
+         if vao_nhom:
+@@ -989,6 +1093,11 @@ class Transport:
+             tag, rep = zc.nhan_dien_goi(self.conn_id, ev, (conn.get("label") or "",))
+             meta["mentioned"], meta["reply_to_bot"] = tag, rep
+             duoc_goi = tag or rep
++            if duoc_goi and not meta.get("audio_urls"):
++                # "@bot nhận xét giúp em" right after the person's voice message: the bot hears that voice message.
++                earlier = self._take_group_voice(ev, thread)
++                if earlier:
++                    meta["audio_urls"] = [earlier]
+             if chu_nhuong and not duoc_goi:
+                 return      # chủ đang nói chuyện trong nhóm và tin này không gọi ai: nhường như cũ
+             if self.policy is not None:
+@@ -1002,11 +1111,16 @@ class Transport:
+                     pol = None
+                     print(f"[zalo-personal bot {self.conn_id}] bộ phán xử lỗi: {type(e).__name__}: {e}", file=sys.stderr)
+                 duoc_goi = duoc_goi or bool(meta.get("mentioned"))
++            if voice_heard and not (tag or rep):
++                # A spoken name is not a tag. In "auto" the judge decides (answer or stay silent); in the other modes
++                # a spoken name counts as a call, as a typed name does.
++                duoc_goi = self._che_do_nhom(thread) != "auto"
++                meta["mentioned"] = duoc_goi
+         if nhom and not vao_nhom and not is_reaction:
+             # Files in a group (0.336.0, see `zc.remember_bare_file`): a file nobody addressed to the bot waits for its
+             # sender's next call; a call that quotes a file, or comes right after the sender's bare file, gets it.
+             nguoi = str(ev.get("sender_id") or "")
+-            if chi_file and files and not duoc_goi and self._che_do_nhom() != "always":
++            if chi_file and files and not duoc_goi and self._che_do_nhom(thread) != "always":
+                 zc.remember_bare_file(self.conn_id, thread, nguoi, files[0], float(ev.get("created_at") or 0))
+             elif (duoc_goi and not files and nguoi and ev.get("sender_type") == "customer" and self.precheck_fn
+                   and str(ev.get("account_id") or "") == self.conn_id):
+@@ -1017,13 +1131,14 @@ class Transport:
+                 if asyncio.iscoroutine(r):
+                     r = await r
+                 if r is not None:           # {} = im, {"reply": ...} = một câu cố định
++                    self._dbg("precheck_im", ev, meta)
+                     cau = str((r or {}).get("reply") or "").strip()
+                     if cau and not nhom:
+                         await self._gui(thread, cau, "private")
+                     return
+-            if chi_file and nhom and not duoc_goi and self._che_do_nhom() != "always":
++            if chi_file and nhom and not duoc_goi and self._che_do_nhom(thread) != "always":
+                 return  # file thả vào nhóm mà không ai gọi bot: không tải, không đưa qua bộ phán xử
+-            if nhom and not duoc_goi and self._che_do_nhom() == "auto":
++            if nhom and not duoc_goi and self._che_do_nhom(thread) == "auto":
+                 if pol and pol.get("mode") == "on":
+                     # Bộ phán xử thay cửa từ khoá: tin hiển nhiên không đáng đã được ghi vết và bỏ ở `prepare`.
+                     if pol.get("action") == "drop":
+@@ -1097,18 +1212,40 @@ class Transport:
+                         anh = [x for x in anh if x]
+                     else:
+                         cau = str(out or "").strip()
+-                    if (cau or anh) and zc._BOTS.get(self.conn_id) is self:
++                    # <voice>...</voice> in an answer is what to SAY; the rest is what to WRITE (the explanation of a lesson).
++                    # Without a voice reply, what was meant to be said is written instead, so nothing is lost.
++                    import zalo_audio_reply
++                    cau, spoken = zalo_audio_reply.split_voice(cau)
++                    want_voice = self._wants_voice(meta, text)
++                    if spoken and not want_voice:
++                        cau, spoken = (cau + "\n\n" + spoken).strip(), ""
++                    # A spoken question gets a SPOKEN answer, and only that when it fits in one recording: the voice goes
++                    # first and the text is sent only if the voice could not be made or sent (never lose the answer).
++                    # A long answer (past the recording limit) keeps the old order: text, then its voice.
++                    solo_voice = bool(want_voice and cau and not spoken
++                                      and len(zalo_audio_reply._speakable(cau)) <= zalo_audio_reply.MAX_CHARS)
++                    if (cau or anh or spoken) and zc._BOTS.get(self.conn_id) is self:
+                         sent = None
+-                        if cau:
++                        ok_voice = None
++                        if want_voice and (spoken or solo_voice):
++                            ok_voice = await self._send_voice(thread, spoken or cau, loai)
++                            if not ok_voice and not cau:
++                                cau = spoken        # the voice failed: what was meant to be said is written instead
++                        if cau and not (solo_voice and ok_voice):
+                             sent = await self._gui(thread, cau, loai, meta, receipt_row=receipt_row)
++                        elif ok_voice and not anh:
++                            sent = True
++                            self._set_delivery(receipt_row, "accepted")
++                        if want_voice and cau and not spoken and not solo_voice:
++                            await self._send_voice(thread, cau, loai)
+                         if anh:
+                             image_sent = await self._gui_anh(thread, anh, loai)
+                             if not cau and image_sent:
+                                 self._set_delivery(receipt_row, "accepted")
+                             elif not cau:
+                                 self._set_delivery(receipt_row, "unknown", reason="image_unconfirmed")
+-                        if cau and nhom and self.policy is not None and sent is not False:
+-                            self.policy.replied(meta, cau)
++                        if (cau or ok_voice) and nhom and self.policy is not None and sent is not False:
++                            self.policy.replied(meta, cau or spoken)
+                     elif receipt_row:
+                         self._set_delivery(receipt_row, "cancelled", reason="bot_stopped")
+                 finally:
+@@ -1174,6 +1311,37 @@ class Transport:
+             self._ghi_loi_gui(thread, cau, loi, chat_type)
+         return bool(ok)
+ 
++    def _wants_voice(self, meta: dict, hoi: str) -> bool:
++        """Should this answer also go out as a spoken mp3? Always when the customer sent a voice message (answer a voice with
++        a voice); otherwise only for a bot with `voice_reply: audio_file`: every answer in a private chat, and in a group
++        only when the asker asks to hear it (`zalo_audio_reply.asks_for_voice`), so a group is not flooded with files."""
++        import zalo_audio_reply
++        if (meta or {}).get("audio_urls") or (meta or {}).get("voice_heard") or (meta or {}).get("quote_voice"):
++            return True
++        cfg = (self.cfg_fn() if self.cfg_fn else {}) or {}
++        if cfg.get("voice_reply") != "audio_file":
++            return False
++        return (meta or {}).get("chat_type") != "group" or zalo_audio_reply.asks_for_voice(hoi)
++
++    async def _send_voice(self, thread: str, cau: str, chat_type: str = "private") -> bool:
++        """Send `cau` as a spoken mp3 after the text. A failure only shows on the bot card and its log; the text already went."""
++        import zalo_audio_reply
++        import zalo_personal_channel as zc
++        conn = zc.ket_noi_theo_id(self.conn_id) or {}
++        # Remember BEFORE sending, like images: the mp3 comes back in the read loop as the account's own file message.
++        zc.ghi_da_gui_anh(self.conn_id, thread, 1)
++        ok, loi = await zalo_audio_reply.send_audio_file(conn, thread, chat_type, cau)
++        if not ok and not send_uncertain(loi):
++            # One more try: the voice engine or the upload can fail once (cold model, busy server). A send that may have
++            # gone out (timeout) is NOT repeated, so the group never gets the recording twice.
++            zc.ghi_da_gui_anh(self.conn_id, thread, 1)
++            ok, loi = await zalo_audio_reply.send_audio_file(conn, thread, chat_type, cau)
++        if not ok:
++            self.last_error = localefmt.chu(f"Gửi tin thoại Zalo lỗi: {loi}", f"Zalo voice reply failed: {loi}")[:300]
++            print(f"[zalo-personal bot {self.conn_id}] {self.last_error}", file=sys.stderr)
++            self._ghi_loi_gui(thread, localefmt.chu("(tin thoại trả lời)", "(voice reply)"), loi, chat_type)
++        return bool(ok)
++
+     async def _gui_anh(self, thread: str, anh: list, chat_type: str = "private"):
+         import zalo_personal_channel as zc
+         # Remember BEFORE sending, like _gui: each image comes back in the read loop as the account's own message.
+diff --git a/server/chatbot_runtime.py b/server/chatbot_runtime.py
+index 97ab04fa..e2c555c0 100644
+--- a/server/chatbot_runtime.py
++++ b/server/chatbot_runtime.py
+@@ -1058,6 +1058,7 @@ def _ly_do_im_co_ban(bot_cfg: dict, meta: dict) -> str:
+     cho phép" là việc của CHỦ và phải nổi lên trang Chatbot, còn "không ai gọi tên" là hành vi
+     đúng và phải im tuyệt đối.
+     """
++    bot_cfg = chatbot_store.with_group_mode(bot_cfg, meta)      # this group's own reply mode, when the owner set one
+     loai = str((meta or {}).get("chat_type") or "private")
+     # The owner switched the bot off in this one chat (Chatbot v5, `blocked`): silent, and nothing to approve.
+     if chatbot_store._in_list((bot_cfg or {}).get("blocked"), (meta or {}).get("chat_id")):
+@@ -1373,6 +1374,7 @@ class PolicyHooks:
+         cfg = chatbot_store.get_bot(self.bot_id)
+         if not cfg or not _rp_is_group(meta) or not _nhom_duoc_phep(cfg, (meta or {}).get("chat_id")):
+             return None
++        cfg = chatbot_store.with_group_mode(cfg, meta)
+         rpc = chatbot_reply_policy.normalize_config(cfg.get("reply_policy"))
+         if cfg.get("reply_when") != "auto":
+             rpc = dict(rpc, mode="off")      # chỉ có nghĩa ở chế độ Tự đánh giá
+@@ -1435,6 +1437,7 @@ class PolicyHooks:
+     def replied(self, meta: dict, text: str) -> None:
+         """Bot vừa nói trong nhóm: nhớ để nhận ra tin nối tiếp của đúng người được trả lời."""
+         cfg = chatbot_store.get_bot(self.bot_id)
++        cfg = chatbot_store.with_group_mode(cfg, meta) if cfg else cfg
+         if not cfg or cfg.get("reply_when") != "auto":
+             return
+         chatbot_reply_policy.note_bot_reply(self.bot_id, str((meta or {}).get("chat_id") or ""),
+@@ -1464,6 +1467,7 @@ def _make_precheck_fn(bot_id: str):
+         if not cfg:
+             return {}
+         meta = _rp_named_meta(cfg, text, meta)      # gọi tên trơn ("nhi mai ơi") cũng là gọi bot
++        cfg = chatbot_store.with_group_mode(cfg, meta)
+         _nho_neu_khong_goi(bot_id, cfg, meta, text)
+         ly_do = _ly_do_im(cfg, meta or {})
+         if not ly_do:
+@@ -1471,6 +1475,11 @@ def _make_precheck_fn(bot_id: str):
+         if (meta or {}).get("member_join"):
+             # A join in a group the bot may not speak in: silent, and not a "call" for the approval queue.
+             return {}
++        if ly_do != "khong_goi_ten":
++            # Silence the owner may need to explain ("why did the bot not answer"): the code is logged, never the
++            # message. "khong_goi_ten" is normal group chatter and would flood the log.
++            print(f"[chatbot {bot_id}] im lặng ở {(meta or {}).get('chat_type') or 'private'} "
++                  f"…{str((meta or {}).get('chat_id') or '')[-6:]}: {ly_do}", file=sys.stderr)
+         if ly_do in ("ngoai_gio_truc", "chat_tat"):
+             # Outside active hours, or the owner switched the bot off in this chat (Chatbot v5): silent, nothing sent. A message the bot WOULD have answered still goes to the
+             # inbox so whoever is on duty reads it in the morning; group chatter in "Tự đánh giá" mode does not,
+diff --git a/server/chatbot_store.py b/server/chatbot_store.py
+index 015e8d1e..2280bd33 100644
+--- a/server/chatbot_store.py
++++ b/server/chatbot_store.py
+@@ -76,6 +76,33 @@ KENH_NGUON_TOKEN = {k: (channels.spec(k).lay_token if channels.spec(k) else "")
+ # giá" (0.64.82): tag/reply vẫn trả lời, còn tin khác thì bot tự xem có phải câu hỏi tài liệu của
+ # nó trả lời được không, xem `chatbot_tu_dong`.
+ REPLY_WHEN = ("mention", "always", "auto")
++# Voice replies on personal Zalo: "audio_file" = the bot also sends its answer as a spoken mp3 (always when the customer sent
++# a voice message or asked to hear it; in private chats every answer). Restored 2026-11-12: an update had dropped this key.
++VOICE_REPLY = ("off", "audio_file")
++
++
++def clean_group_modes(v: Any) -> dict:
++    """`group_modes`: {group id: reply mode} (2026-11-12). One group can run in a different mode than the bot, e.g. a small
++    training group where the bot may decide for itself whether to answer ("always": every message reaches the Agent, which
++    answers or stays silent) while the bot stays on "mention" everywhere else. Unknown modes and ids are dropped."""
++    if not isinstance(v, dict):
++        return {}
++    out = {}
++    for k, m in v.items():
++        k = str(k or "").strip()
++        if k and " " not in k and m in REPLY_WHEN and len(out) < 50:
++            out[k] = m
++    return out
++
++
++def with_group_mode(cfg: dict, meta: Optional[dict]) -> dict:
++    """`cfg` itself, or a COPY whose `reply_when` is this group's own mode when the owner set one for it (`group_modes`).
++    Groups only: a private chat never changes mode."""
++    m = meta or {}
++    if str(m.get("chat_type") or "") != "group":
++        return cfg
++    mode = clean_group_modes((cfg or {}).get("group_modes")).get(str(m.get("chat_id") or "").strip())
++    return dict(cfg, reply_when=mode) if mode and mode != cfg.get("reply_when") else cfg
+ 
+ # "Bot trả lời AI" (0.64.85), khác `reply_when` (khi nào lên tiếng TRONG nhóm):
+ #   "all"  - mọi cuộc chat trên kênh: chat riêng ai cũng được, mọi nhóm bot có mặt (không cần khai).
+@@ -479,12 +506,18 @@ def can_xac_nhan_ngoai_le(moi: list, cu: Any, xac_nhan: Any) -> bool:
+ 
+ 
+ def ngoai_le_cua(cfg: dict, meta: Optional[dict]) -> Optional[dict]:
+-    """The exception that applies to this turn, or None. Private chats only, and only on the channel account the
+-    exception names: both `chat_id` and `account_id` of the turn must match exactly."""
++    """The exception that applies to this turn, or None. Only on the channel account the exception names.
++
++    Private chat: `chat_id` and `account_id` of the turn must match exactly. Group (2026-11-12): the exception follows
++    the PERSON. An exception names a private chat, whose id is that person's own id on the channel, so a group turn
++    whose SENDER (`user_id`, set by the channel from the message, never from its text) is that person runs at the
++    exception's level too. Before this the owner's private chat was "full" but the same owner giving an order in a
++    group ran at the bot's own level, and sends or reminders ordered there were blocked."""
+     m = meta or {}
+-    if str(m.get("chat_type") or "") != "private":
++    kind = str(m.get("chat_type") or "")
++    if kind not in ("private", "group"):
+         return None
+-    cid = str(m.get("chat_id") or "").strip()
++    cid = str((m.get("chat_id") if kind == "private" else m.get("user_id")) or "").strip()
+     aid = str(m.get("account_id") or "").strip()
+     if not cid or not aid:
+         return None
+@@ -664,6 +697,8 @@ def _public(b: dict) -> dict:
+     elif out["audience"] not in AUDIENCE:
+         out["audience"] = AUDIENCE_HEP_NHAT
+     out["people"] = _clean_groups(out.get("people"))
++    out["voice_reply"] = out.get("voice_reply") if out.get("voice_reply") in VOICE_REPLY else "off"
++    out["group_modes"] = clean_group_modes(out.get("group_modes"))
+     # Chats the owner switched the bot off in (Chatbot v5), even though the audience would let it answer there.
+     out["blocked"] = _clean_groups(out.get("blocked"))
+     # Zalo labels to stay out of (0.281.0). A record from before has none: the bot answers every chat as before.
+@@ -1028,6 +1063,7 @@ def create_bot(data: dict) -> tuple[Optional[str], str]:
+             "bot_username": str(data.get("bot_username") or "").strip().lstrip("@"),
+             "groups": _clean_groups(data.get("groups")),
+             "reply_when": (data.get("reply_when") if data.get("reply_when") in REPLY_WHEN else "mention"),
++            "voice_reply": (data.get("voice_reply") if data.get("voice_reply") in VOICE_REPLY else "off"),
+             "audience": (data.get("audience") if data.get("audience") in AUDIENCE else AUDIENCE_DEFAULT),
+             "people": _clean_groups(data.get("people")),
+             "reply_policy": __import__("chatbot_reply_policy").merge_config(None, data.get("reply_policy")),
+@@ -1084,7 +1120,7 @@ def _nhan_brain_cho_tk(bot: dict) -> None:
+ # thêm trường mới vào bản ghi mà quên loại khỏi danh sách đen là mở một đường ghi không ai ngờ.
+ # `rate_limit` (trần câu trả lời mỗi người mỗi giờ) bị gỡ ở 0.85.4: bản ghi cũ còn khoá đó thì cứ để nguyên,
+ # không ai đọc nó nữa, và patch gửi khoá đó tới thì bị bỏ qua như mọi khoá lạ.
+-_PATCHABLE = ("name", "icon", "groups", "people", "audience", "reply_when", "handoff_to",
++_PATCHABLE = ("name", "icon", "groups", "people", "audience", "reply_when", "voice_reply", "group_modes", "handoff_to",
+               "agent_slug", "agent_brain", "brain", "bot_username", "token", "enabled",
+               "nguon_tra_loi", "muc_quyen", "ngon_ngu", "account_ids", "reply_policy", "gio_truc",
+               "nhuong_tay_phut", "ngoai_le", "nhan_ket_ban", "skip_labels", "blocked",
+@@ -1163,6 +1199,11 @@ def update_bot(bot_id: str, patch: dict) -> tuple[bool, str]:
+                 elif k == "reply_when":
+                     if v in REPLY_WHEN:
+                         b["reply_when"] = v
++                elif k == "voice_reply":
++                    if v in VOICE_REPLY:
++                        b["voice_reply"] = v
++                elif k == "group_modes":
++                    b["group_modes"] = clean_group_modes(v)
+                 elif k == "reply_policy":
+                     # Gộp từng khoá, giá trị lạ giữ nguyên giá trị cũ (xem `merge_config`).
+                     b["reply_policy"] = __import__("chatbot_reply_policy").merge_config(b.get("reply_policy"), v)
+diff --git a/server/main.py b/server/main.py
+index 66a52ec1..8da5e9fe 100644
+--- a/server/main.py
++++ b/server/main.py
+@@ -15803,6 +15803,63 @@ async def _zalo_send_file_to(chat_id, path) -> tuple:
+     return await bot.send_file(path, chat=cid)
+ 
+ 
++async def _zalo_voice_deliver(rem, text, brain) -> tuple:
++    """A reminder with a Zalo target (2026-11-16): the owner is tagged, "rung" and sent the note as a voice message.
++    The connection is the one the reminder names, else the only enabled personal Zalo account."""
++    import zalo_cli
++    import zalo_personal_channel as zc
++    import zalo_voice_reminder as zvr
++    from channels import zalo_personal as zp
++    tg = zvr.clean_target(rem.get("zalo"))
++    if not tg:
++        return False, "no Zalo thread"
++    conns = zc._ket_noi()
++    want = tg["conn"].strip().lower()
++    # The account is named by id or by the name on the Connections page ("Crewvn").
++    conn = (next((c for c in conns if c.get("id") == tg["conn"] or str(c.get("label") or "").strip().lower() == want), None)
++            if want else (conns[0] if len(conns) == 1 else None))
++    if not conn:
++        return False, localefmt.chu("không rõ nick Zalo nào để gửi (kết nối đã tắt hoặc có nhiều nick)",
++                                    "no single Zalo account to send from (connection off, or several accounts)")
++    root = _brain_root(brain)
++    chat_type = "group" if tg["type"] == 1 else "private"
++
++    async def send_text(line, mention=None):
++        return await zp.gui({"id": conn["id"]}, tg["thread"], line, chat_type, mention)
++
++    async def make_voice(line):
++        import voice_offline      # Piper voices kept on the machine, so the reminder is spoken with or without internet
++        res = await voice_note.make(root, line, synth=voice_offline.offline_first(voice_note._chosen_synth()))
++        if not res.get("ok"):
++            raise RuntimeError(str(res.get("error") or "voice engine failed"))
++        return str(Path(root) / res["rel_path"])
++
++    async def send_voice(path):
++        home = zalo_cli.home_of(conn)
++        # A real voice bubble first; an older javis-zalo (no such tool) or a refused link falls back to a file.
++        ok, _d, err = await zalo_cli.send_voice(conn["id"], home, tg["thread"], Path(path), tg["type"])
++        if ok:
++            return True, ""
++        print(f"[zalo voice] bubble failed, sending the mp3 as a file: {err}", flush=True)
++        if "zalo_send_voice" in str(err):     # an update wiped the tool: put it back for the next connection start
++            import zalo_voice_tool
++            zalo_voice_tool.ensure(cfgmod.STATE_DIR)
++        ok, _d, err2 = await zalo_cli.send_files(conn["id"], home, tg["thread"], [Path(path)], tg["type"])
++        return ok, ("" if ok else err2) or ""
++
++    async def send_reminder(title):
++        # The reminder entry inside the Zalo chat (`javis-zalo reminder create`), set for now: Zalo notifies at once.
++        home = zalo_cli.home_of(conn)
++        if not home:
++            return False, "no session folder"
++        ok, _d, err = await zalo_cli.run_cli({"home": home}, ["reminder", "create"], [tg["thread"], title],
++                                             ["-t", str(tg["type"])])
++        return ok, str(err or "")
++
++    return await zvr.deliver(tg, text, send_text=send_text, send_voice=send_voice, make_voice=make_voice, root=root,
++                             send_reminder=send_reminder)
++
++
+ import my_tasks as my_tasks_mod
+ import gcal_read
+ 
+@@ -15896,6 +15953,7 @@ reminders_feature = reminders_mod.register(app, reminders_mod.RemindersDeps(
+     send_file=lambda chat_id, path, brain: _send_voice_file(chat_id, path, brain),
+     build_agent_prompt=_background_agent_prompt,          # made in a partner chat -> runs as that assistant
+     finish_agent_run=_finish_background_agent_run,
++    zalo_deliver=_zalo_voice_deliver,
+ ))
+ 
+ 
+diff --git a/server/reminders.py b/server/reminders.py
+index 156234b9..a860a246 100644
+--- a/server/reminders.py
++++ b/server/reminders.py
+@@ -136,7 +136,8 @@ def _engine_tag() -> str:
+ 
+ # A reminder that still has a schedule: "paused" (0.422.0) is skipped by the tick but kept.
+ LIVE_STATUSES = ("pending", "paused")
+-MAX_KEEP = 500                 # trần số bản ghi giữ lại mỗi brain
++MAX_RUNS_CAP = 200              # most runs a Zalo voice reminder may be told to repeat (max_runs)
++MAX_KEEP = 500                # trần số bản ghi giữ lại mỗi brain
+ SCRIPT_TIMEOUT_S = 120         # trần thời gian chạy 1 job script
+ SCRIPT_OUT_CAP = 3500          # trần ký tự stdout đẩy về Telegram
+ # Pictures a `task` run made, sent to the asking chat on channels that need the file itself (#1285).
+@@ -436,6 +437,9 @@ class RemindersDeps:
+     # register_brain(brain): remember a brain that now holds a reminder so `scheduler_brains`
+     # keeps returning it (needed for folders outside BRAINS_DIR). None = nothing to register.
+     register_brain: Optional[Callable[[str], None]] = None
++    # 2026-11-16: async zalo_deliver(rem, text, brain) -> (ok, err): a reminder with a Zalo target tags the owner,
++    # "rings" and speaks the note there (zalo_voice_reminder.deliver). None = the target is ignored.
++    zalo_deliver: Optional[Callable] = None
+ 
+ 
+ class RemindersFeature:
+@@ -520,7 +524,8 @@ class RemindersFeature:
+     def _create(self, brain: str, text: str, *, delay_min=None, at=None, due_at=None,
+                 chat_id="", mode="notify", repeat_min=0, label="", cron=None, script="",
+                 created_by="user", allow_no_channel=False, muc_quyen=None,
+-                remember_last=False, speak=False, call=False, bot_id="", agent="") -> dict:
++                remember_last=False, speak=False, call=False, bot_id="", agent="",
++                zalo=None, max_runs=0) -> dict:
+         mode = mode if mode in VALID_MODE else "notify"
+         mq = str(muc_quyen or "").strip().lower()
+         mq = mq if mq in VALID_MUC_QUYEN else MUC_QUYEN_MAC_DINH
+@@ -566,6 +571,19 @@ class RemindersFeature:
+             "created_by": created_by, "created_at": _now(),
+             "fired_at": 0.0, "result": "", "error": "",
+         }
++        # 2026-11-16: a Zalo target (tag, virtual call, voice note) and how many times a repeating one may run.
++        if zalo:
++            import zalo_voice_reminder as zvr
++            target = zvr.clean_target(zalo)
++            if not target:
++                raise ValueError(localefmt.chu("Đích Zalo thiếu mã cuộc chat (thread)", "The Zalo target has no chat id (thread)"))
++            rem["zalo"] = target
++        try:
++            runs = max(0, min(int(float(max_runs or 0)), MAX_RUNS_CAP))
++        except (TypeError, ValueError):
++            runs = 0
++        if runs:
++            rem["max_runs"] = runs
+         # 0.429.0: made in a dedicated chatbot's turn -> the Tasks page shows it under that bot's assistant.
+         bid = str(bot_id or "").strip()
+         if re.fullmatch(r"bot_[A-Za-z0-9_-]{1,64}", bid):
+@@ -602,6 +620,8 @@ class RemindersFeature:
+                 "remember_last": bool(r.get("remember_last")),
+                 "speak": bool(r.get("speak")),
+                 "call": bool(r.get("call")),
++                "zalo": r.get("zalo") or None, "max_runs": int(r.get("max_runs") or 0),
++                "runs_done": int(r.get("runs_done") or 0),
+                 # 0.429.0: who made it. bot_id names the chatbot whose turn created it ("" = the owner or Javis Core).
+                 "created_by": r.get("created_by", ""), "bot_id": r.get("bot_id", ""),
+                 # the Partners-page assistant it runs as ("" = Javis).
+@@ -1101,6 +1121,16 @@ class RemindersFeature:
+                     print(f"[reminders] voice note not sent: {type(e).__name__}: {e}", file=sys.stderr)
+             if mode == "task" and ok and not loi and self.deps.send_file:
+                 await self._send_run_images(brain, rem, body, t0)
++            if rem.get("zalo") and not loi and self.deps.zalo_deliver:
++                # The owner's Zalo: tag, virtual call, voice note. A failure here is a failed firing, said in `error`.
++                try:
++                    zok, zerr = await self.deps.zalo_deliver(rem, text if mode == "notify" else msg, brain)
++                except Exception as e:
++                    zok, zerr = False, f"{type(e).__name__}: {e}"
++                if not zok:
++                    ok, send_err = False, f"Zalo: {zerr}"[:300]
++                elif zerr:
++                    print(f"[reminders] zalo delivery note: {zerr}", file=sys.stderr)
+ 
+         work_log.append(str(self.deps.brain_root(brain)), "reminder", str(rem.get("id") or ""), head,
+                         "stopped" if stopped else "retry" if retry_at else "fail" if (run_failed or not ok) else "ok",
+@@ -1145,7 +1175,11 @@ class RemindersFeature:
+                     cur["missed_at"] = _now()
+                     print(f"[reminders] {cur.get('id')}: {missed} lần chạy bị lỡ vì lượt trước trễ/chạy lâu",
+                           file=sys.stderr)
+-                if cron:
++                cur["runs_done"] = int(cur.get("runs_done") or 0) + 1
++                cap = int(cur.get("max_runs") or 0)
++                if cap and cur["runs_done"] >= cap:
++                    cur["status"] = "cancelled" if stopped else ("done" if ok and not run_failed else "failed")
++                elif cron:
+                     try:
+                         cur["due_at"] = cron_util.cron_next(cron, _now(), VN_TZ())
+                         cur["status"] = "pending"
+@@ -1476,6 +1510,8 @@ class RemindersFeature:
+                         call=_truthy(p.get("call")),
+                         bot_id=str(p.get("bot_id") or ""),
+                         agent=str(p.get("agent") or ""),
++                        zalo=p.get("zalo") if isinstance(p.get("zalo"), dict) else None,
++                        max_runs=p.get("max_runs") or 0,
+                     )
+             except NotifyNotReady as e:
+                 # can_force: chỗ gọi (dashboard/chat) hỏi lại người dùng rồi tạo tiếp với
+diff --git a/server/voice_note.py b/server/voice_note.py
+index 6de13490..a5a9fc11 100644
+--- a/server/voice_note.py
++++ b/server/voice_note.py
+@@ -146,7 +146,79 @@ async def _edge(text: str, voice: str) -> bytes:
+     except Exception:
+         pass
+     out = b""
+-    async for chunk in edge_tts.Communicate(text, voice, rate="+0%").stream():
+-        if chunk.get("type") == "audio":
+-            out += chunk.get("data") or b""
++    try:
++        async for chunk in edge_tts.Communicate(text, voice, rate="+0%").stream():
++            if chunk.get("type") == "audio":
++                out += chunk.get("data") or b""
++    except Exception as e:  # noqa: BLE001 - NoAudioReceived: a long-running process can keep a stale token
++        import sys
++        print(f"[voice note] Edge in-process failed ({type(e).__name__}: {e}); trying a fresh process",
++              file=sys.stderr, flush=True)
++        out = b""
++    return out or await _edge_fresh_process(text, voice) or await _google_tts(text, voice)
++
++
++async def _google_tts(text: str, voice: str) -> bytes:
++    """Last resort when Edge keeps answering NoAudioReceived (the VPS, 2026-11-16): Google Translate's
++    public speech endpoint, in chunks of at most 180 characters, joined into one mp3."""
++    import sys
++    import httpx
++    lang = (voice or "vi")[:2].lower() or "vi"
++    words, chunks, cur = str(text or "").split(), [], ""
++    for w in words:
++        if cur and len(cur) + 1 + len(w) > 180:
++            chunks.append(cur)
++            cur = w
++        else:
++            cur = f"{cur} {w}".strip()
++    if cur:
++        chunks.append(cur)
++    out = b""
++    try:
++        async with httpx.AsyncClient(timeout=20, headers={"User-Agent": "Mozilla/5.0"}) as c:
++            for i, part in enumerate(chunks):
++                r = await c.get("https://translate.google.com/translate_tts",
++                                params={"ie": "UTF-8", "client": "tw-ob", "tl": lang, "q": part,
++                                        "total": len(chunks), "idx": i, "textlen": len(part)})
++                if r.status_code != 200 or not r.content:
++                    print(f"[voice note] Google speech answered {r.status_code}", file=sys.stderr, flush=True)
++                    return b""
++                out += r.content
++    except Exception as e:  # noqa: BLE001
++        print(f"[voice note] Google speech failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
++        return b""
+     return out
++
++
++async def _edge_fresh_process(text: str, voice: str) -> bytes:
++    """Same voice, asked from a fresh python process. A server that has run for a while sometimes gets
++    `NoAudioReceived` from Edge while a new process is answered normally (seen on the VPS, 2026-11-16)."""
++    import asyncio
++    import sys
++    import tempfile
++    tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
++    tmp.close()
++    try:
++        proc = await asyncio.create_subprocess_exec(
++            sys.executable, "-m", "edge_tts", "--voice", voice, "--text", text, "--write-media", tmp.name,
++            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
++        try:
++            _o, err = await asyncio.wait_for(proc.communicate(), timeout=45)
++        except asyncio.TimeoutError:
++            proc.kill()
++            print("[voice note] fresh Edge process timed out", file=sys.stderr, flush=True)
++            return b""
++        audio = Path(tmp.name).read_bytes()
++        if not audio:
++            tail = (err or b"").decode(errors="replace").strip().splitlines()[-1:] or [""]
++            print(f"[voice note] fresh Edge process gave no audio (exit {proc.returncode}, voice={voice}, text={text[:80]!r}): {tail[0][:200]}",
++                  file=sys.stderr, flush=True)
++        return audio
++    except Exception as e:  # noqa: BLE001
++        print(f"[voice note] fresh Edge process failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
++        return b""
++    finally:
++        try:
++            os.unlink(tmp.name)
++        except OSError:
++            pass
+diff --git a/server/voice_offline.py b/server/voice_offline.py
+new file mode 100644
+index 00000000..6fb298b9
+--- /dev/null
++++ b/server/voice_offline.py
+@@ -0,0 +1,454 @@
++"""Offline voices (Piper): Vietnamese, English and Chinese read aloud with no internet (2026-11-16).
++
++The engine and the three voice files live in `<state>/tts` (`lib/` = the piper-tts package, `voices/` = the .onnx
++models and their .json), outside the app image, so an update does not remove them and a reminder can be spoken at
++any hour even when the free online voice refuses the server. Missing files just mean `speak` returns b"" and the
++caller falls back to the online voice.
++
++Setup (once per machine, also done by `python server/voice_offline.py install`):
++    pip install --target <state>/tts/lib piper-tts
++    voices from https://huggingface.co/rhasspy/piper-voices (vi_VN-vais1000, en_US-lessac, zh_CN-huayan, all "medium")
++"""
++from __future__ import annotations
++
++import asyncio
++import io
++import os
++import re
++import subprocess
++import sys
++import wave
++from pathlib import Path
++from typing import Dict, Optional
++
++VOICES = {
++    "vi": "vi_VN-vais1000-medium",
++    "en": "en_US-lessac-medium",
++    "zh": "zh_CN-huayan-medium",
++}
++_BASE = "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
++_PATHS = {
++    "vi": "vi/vi_VN/vais1000/medium/",
++    "en": "en/en_US/lessac/medium/",
++    "zh": "zh/zh_CN/huayan/medium/",
++}
++_CJK = re.compile(r"[㐀-鿿]")
++_VI = re.compile(r"[ăâđêôơưạảấầẩẫậắằẳẵặẹẻẽếềểễệỉịọỏốồổỗộớờởỡợụủứừửữựỳỵỷỹáàãéèíìĩóòõúùũý]", re.I)
++_LOADED: Dict[str, object] = {}
++
++# One manner of speaking for every voice and language: slower (0.8 = a fifth slower, pitch kept), the same loudness
++# and the same sample rate, so Vietnamese, English and Chinese pieces sound like one speaker's pace.
++# JAVIS_VOICE_SPEED changes the pace (1.0 = as the engine speaks, 0.7 = slower still).
++try:
++    SPEED = min(1.0, max(0.5, float(os.getenv("JAVIS_VOICE_SPEED", "0.8"))))
++except ValueError:
++    SPEED = 0.8
++_POST = f"atempo={SPEED},loudnorm=I=-16:TP=-1.5:LRA=11,aresample=24000"
++
++
++def home() -> Path:
++    try:
++        import config as cfg
++        return Path(cfg.STATE_DIR) / "tts"
++    except Exception:       # noqa: BLE001
++        return Path(os.getenv("JAVIS_STATE_DIR", ".")) / "tts"
++
++
++def language(text: str, voice: str = "") -> str:
++    """vi, en or zh: Chinese characters win, then Vietnamese letters, then the language of the named voice."""
++    t = str(text or "")
++    if _CJK.search(t):
++        return "zh"
++    if _VI.search(t):
++        return "vi"
++    v = str(voice or "").lower()
++    return "zh" if v.startswith("zh") else "vi" if v.startswith("vi") else "en"
++
++
++def available(lang: str) -> bool:
++    h = home()
++    return (h / "lib" / "piper").is_dir() and (h / "voices" / f"{VOICES[lang]}.onnx").is_file()
++
++
++def _load(lang: str):
++    if lang not in _LOADED:
++        lib = str(home() / "lib")
++        if lib not in sys.path:
++            sys.path.append(lib)
++        from piper import PiperVoice
++        _LOADED[lang] = PiperVoice.load(str(home() / "voices" / f"{VOICES[lang]}.onnx"))
++    return _LOADED[lang]
++
++
++def _speak_sync(text: str, lang: str) -> bytes:
++    buf = io.BytesIO()
++    w = wave.open(buf, "wb")
++    _load(lang).synthesize_wav(text, w)
++    w.close()
++    r = subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "wav", "-i", "pipe:0", "-filter:a", _POST, "-codec:a", "libmp3lame",
++                        "-q:a", "4", "-f", "mp3", "pipe:1"], input=buf.getvalue(), capture_output=True, timeout=60)
++    return r.stdout if r.returncode == 0 else b""
++
++
++VIENEU_VOICE = "Trúc Ly"      # female, northern, natural (preset of VieNeu-TTS v3 Turbo, Apache-2.0)
++# argv: text, preset voice, out.wav, reference wav ("" = no clone). With a reference recording the model clones that
++# voice (the owner's "Giọng sách"): no AI tokens, a few seconds per sentence on the VPS. `pronounce.json` in the tts
++# folder (optional) rewrites words before they are read, like the daily-video skill does.
++_VIENEU_SCRIPT = ("import sys\nfrom vieneu import Vieneu\n"
++                  "text, voice, out, ref = sys.argv[1:5]\n"
++                  "if ref:\n"
++                  "    v = Vieneu(mode='v3turbo')\n"
++                  "    v.save(v.infer(text, ref_audio=ref), out)\n"
++                  "else:\n"
++                  "    v = Vieneu(precision='int8')\n"
++                  "    v.save(v.infer(text, voice=voice), out)\n")
++# How the company name is said (owner, 2026-11-18): the letters CREWVN read as one word come out wrong.
++_SAY = ((re.compile(r"\bcrewvn\b", re.I), "cờ riu vi en"),)
++
++
++def clone_ref() -> Optional[Path]:
++    """The recording of the voice to clone, or None (then the preset voice speaks). `JAVIS_VOICE_CLONE_REF` names it;
++    otherwise `<state>/tts/ref_giong.wav`. Put the owner's reference file there with
++    `python server/voice_offline.py clone <file.wav>`."""
++    for c in (os.getenv("JAVIS_VOICE_CLONE_REF", "").strip(), str(home() / "ref_giong.wav")):
++        if c and Path(c).is_file() and Path(c).stat().st_size > 2000:
++            return Path(c)
++    return None
++
++
++def _hf_dir() -> Path:
++    """Weights folder: `hf-w` (the clone model, v3 turbo) when it exists, else `hf`."""
++    h = home()
++    return h / "hf-w" if (h / "hf-w").is_dir() else h / "hf"
++
++
++def vieneu_available() -> bool:
++    h = home()
++    return (h / "vieneu-lib" / "vieneu").is_dir() and _hf_dir().is_dir()
++
++
++def say_words(text: str) -> str:
++    """The text as it must be pronounced: the company name spelled out, plus the optional `pronounce.json` dictionary
++    (`{"từ": "cách đọc"}`) in the tts folder."""
++    t = str(text or "")
++    for rx, rep in _SAY:
++        t = rx.sub(rep, t)
++    try:
++        import json
++        d = json.loads((home() / "pronounce.json").read_text(encoding="utf-8"))
++        for k, v in sorted(d.items(), key=lambda kv: -len(kv[0])):
++            if k:
++                t = re.sub(re.escape(str(k)), str(v), t, flags=re.I)
++    except (OSError, ValueError, AttributeError):
++        pass
++    return t
++
++
++# ---- Warm VieNeu: the model is loaded ONCE and kept in a worker process ---------------------------------------------
++# Starting VieNeu for every sentence spent most of the time loading the model (about 33 s for one short sentence on the
++# VPS). The worker loads it once and then reads one request per line: {"text", "voice", "out"} -> {"ok"} | {"error"}.
++# Protocol lines carry `_MARK` on a private copy of stdout; everything the library prints goes to stderr (a log file),
++# so a progress bar can never break the protocol. Pure code: no AI tokens are spent on speech.
++_MARK = "@@JAVIS_TTS@@"
++_WORKER_SCRIPT = (
++    "import os, sys, json\n"
++    "proto = os.fdopen(os.dup(1), 'w', encoding='utf-8')\n"
++    "os.dup2(2, 1)\n"
++    "ref = sys.argv[1]\n"
++    "from vieneu import Vieneu\n"
++    "v = Vieneu(mode='v3turbo') if ref else Vieneu(precision='int8')\n"
++    "try:\n"        # the FIRST sentence is slow (measured 22 s against 4-5 s for the next ones): pay it here, not in chat
++    "    v.infer('Xin chào.', ref_audio=ref) if ref else v.infer('Xin chào.', voice=sys.argv[2])\n"
++    "except Exception:\n"
++    "    pass\n"
++    "def say(d):\n"
++    f"    proto.write({_MARK!r} + json.dumps(d) + '\\n'); proto.flush()\n"
++    "say({'ready': True})\n"
++    "for line in sys.stdin:\n"
++    "    try:\n"
++    "        r = json.loads(line)\n"
++    "        a = v.infer(r['text'], ref_audio=ref) if ref else v.infer(r['text'], voice=r.get('voice'))\n"
++    "        v.save(a, r['out'])\n"
++    "        say({'ok': True})\n"
++    "    except Exception as e:\n"
++    "        say({'ok': False, 'error': type(e).__name__ + ': ' + str(e)[:200]})\n")
++WORKER_START_S = 240        # loading the model (first start on a 2-CPU VPS)
++WORKER_REQUEST_S = 150      # one sentence
++_W: Dict[str, object] = {"proc": None, "ref": None, "lock": None, "log": None}
++
++
++async def _worker_read(proc, timeout: float) -> dict:
++    import json
++    deadline = asyncio.get_running_loop().time() + timeout
++    while True:
++        left = deadline - asyncio.get_running_loop().time()
++        if left <= 0:
++            raise TimeoutError("VieNeu worker did not answer in time")
++        line = await asyncio.wait_for(proc.stdout.readline(), left)
++        if not line:
++            raise RuntimeError("VieNeu worker exited")
++        s = line.decode("utf-8", "replace").strip()
++        if s.startswith(_MARK):
++            return json.loads(s[len(_MARK):])
++
++
++def _worker_stop() -> None:
++    p = _W.get("proc")
++    _W["proc"] = None
++    if p is not None and p.returncode is None:
++        try:
++            p.kill()
++        except ProcessLookupError:
++            pass
++
++
++async def _worker() -> Optional[object]:
++    """The running worker for the current reference voice, started (and the model loaded) if needed. None on failure."""
++    ref = clone_ref()
++    key = str(ref) if ref else ""
++    p = _W.get("proc")
++    if p is not None and p.returncode is None and _W.get("ref") == key:
++        return p
++    _worker_stop()
++    h = home()
++    env = dict(os.environ, PYTHONPATH=str(h / "vieneu-lib"), HF_HOME=str(_hf_dir()), HF_HUB_OFFLINE="1",
++               PYTHONUNBUFFERED="1")
++    log = None
++    try:
++        log = open(h / "worker.log", "ab")
++    except OSError:
++        pass
++    t0 = asyncio.get_running_loop().time()
++    try:
++        p = await asyncio.create_subprocess_exec(sys.executable, "-c", _WORKER_SCRIPT, key, VIENEU_VOICE, env=env,
++                                                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
++                                                 stderr=log or asyncio.subprocess.DEVNULL)
++        _W.update(proc=p, ref=key)
++        first = await _worker_read(p, WORKER_START_S)
++        if not first.get("ready"):
++            raise RuntimeError(f"unexpected first line {first}")
++    except Exception as e:      # noqa: BLE001
++        print(f"[voice offline] VieNeu worker did not start: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
++        _worker_stop()
++        return None
++    finally:
++        if log is not None:
++            log.close()         # the child keeps its own copy of the file
++    print(f"[voice offline] VieNeu worker ready in {asyncio.get_running_loop().time() - t0:.1f}s "
++          f"({'cloned voice' if key else 'preset voice'})", file=sys.stderr, flush=True)
++    return p
++
++
++async def _speak_warm(text: str) -> bytes:
++    """One sentence through the warm worker: mp3 bytes, or b"" (the worker is then restarted on the next call)."""
++    import json
++    import tempfile
++    if _W.get("lock") is None:
++        _W["lock"] = asyncio.Lock()
++    async with _W["lock"]:      # one sentence at a time: the model is not shared between requests
++        p = await _worker()
++        if p is None:
++            return b""
++        out = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
++        out.close()
++        try:
++            p.stdin.write((json.dumps({"text": say_words(text), "voice": VIENEU_VOICE, "out": out.name},
++                                      ensure_ascii=False) + "\n").encode("utf-8"))
++            await p.stdin.drain()
++            r = await _worker_read(p, WORKER_REQUEST_S)
++            if not r.get("ok"):
++                print(f"[voice offline] VieNeu worker: {r.get('error')}", file=sys.stderr, flush=True)
++                return b""
++            wav = Path(out.name).read_bytes()
++            return await asyncio.to_thread(_to_mp3, wav) if wav else b""
++        except Exception as e:      # noqa: BLE001 - a stuck or dead worker is replaced on the next sentence
++            print(f"[voice offline] VieNeu worker failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
++            _worker_stop()
++            return b""
++        finally:
++            try:
++                os.unlink(out.name)
++            except OSError:
++                pass
++
++
++def warm_soon() -> None:
++    """Start the worker in the background (model loaded before the first voice message arrives). Never raises; does
++    nothing when VieNeu is not installed or `JAVIS_VIENEU_WARM=0`."""
++    if os.getenv("JAVIS_VIENEU_WARM", "1") == "0" or not vieneu_available():
++        return
++    try:
++        loop = asyncio.get_running_loop()
++    except RuntimeError:
++        return
++
++    async def go():
++        if _W.get("lock") is None:
++            _W["lock"] = asyncio.Lock()
++        async with _W["lock"]:
++            await _worker()
++    loop.create_task(go())
++
++
++async def speak_vi_clone(text: str) -> bytes:
++    """Vietnamese read by VieNeu (the cloned voice when a reference recording is set up). mp3 bytes, or b"" when VieNeu
++    is not installed or fails; never raises and never falls back to another engine, so the caller picks the fallback.
++    The warm worker answers first; a one-shot process (slow: loads the model) is the backup when the worker is off."""
++    if not vieneu_available() or not str(text or "").strip():
++        return b""
++    if os.getenv("JAVIS_VIENEU_WARM", "1") != "0":
++        b = await _speak_warm(text)
++        if b:
++            return b
++    try:
++        return await asyncio.to_thread(_vieneu_sync, text)
++    except Exception as e:      # noqa: BLE001
++        print(f"[voice offline] VieNeu failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
++        return b""
++
++
++def _to_mp3(wav: bytes) -> bytes:
++    r = subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "wav", "-i", "pipe:0", "-filter:a", _POST, "-codec:a", "libmp3lame",
++                        "-q:a", "4", "-f", "mp3", "pipe:1"], input=wav, capture_output=True, timeout=60)
++    return r.stdout if r.returncode == 0 else b""
++
++
++def _vieneu_sync(text: str) -> bytes:
++    """Vietnamese (and Vietnamese-English mixed) text read by VieNeu in its own process: its numpy and onnxruntime
++    stay in `<state>/tts/vieneu-lib` and never meet the server's. Weights are in `<state>/tts/hf`, read offline."""
++    import tempfile
++    h = home()
++    env = dict(os.environ, PYTHONPATH=str(h / "vieneu-lib"), HF_HOME=str(_hf_dir()), HF_HUB_OFFLINE="1")
++    out = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
++    out.close()
++    ref = clone_ref()
++    try:
++        r = subprocess.run([sys.executable, "-c", _VIENEU_SCRIPT, say_words(text), VIENEU_VOICE, out.name,
++                            str(ref) if ref else ""], env=env, capture_output=True, text=True, timeout=180)
++        wav = Path(out.name).read_bytes()
++        if r.returncode != 0 or not wav:
++            print(f"[voice offline] VieNeu gave no audio (exit {r.returncode}): {(r.stderr or '').strip()[-200:]}",
++                  file=sys.stderr, flush=True)
++            return b""
++        return _to_mp3(wav)
++    finally:
++        try:
++            os.unlink(out.name)
++        except OSError:
++            pass
++
++
++_RUN = re.compile(r"[㐀-鿿，、。！？；]+|[^㐀-鿿，、。！？；]+")
++_CLAUSE = re.compile(r"(?<=[.!?;\n])\s+")
++
++
++def segments(text: str, voice: str = "") -> list:
++    """[(lang, text)] in reading order: a sentence that mixes Vietnamese, English and Chinese is cut at sentence
++    ends and at every change between Chinese characters and other letters; neighbours in the same language are
++    joined, so each engine is started as few times as possible."""
++    out: list = []
++    for clause in _CLAUSE.split(str(text or "")):
++        for run in _RUN.findall(clause):
++            if not re.search(r"\w", run):
++                continue
++            lang = "zh" if _CJK.search(run) else "vi" if _VI.search(run) else ("vi" if str(voice).lower().startswith("vi") and not out else "en")
++            if out and out[-1][0] == lang:
++                out[-1] = (lang, out[-1][1] + " " + run.strip())
++            else:
++                out.append((lang, run.strip()))
++    return out
++
++
++def _concat(parts: list) -> bytes:
++    """One mp3 from several (the engines run at different sample rates, so they are decoded and joined)."""
++    import tempfile
++    tmp = tempfile.mkdtemp()
++    try:
++        cmd = ["ffmpeg", "-loglevel", "error", "-y"]
++        for i, b in enumerate(parts):
++            p = Path(tmp) / f"{i}.mp3"
++            p.write_bytes(b)
++            cmd += ["-i", str(p)]
++        cmd += ["-filter_complex", "".join(f"[{i}:a]aresample=24000[a{i}];" for i in range(len(parts)))
++                + "".join(f"[a{i}]" for i in range(len(parts))) + f"concat=n={len(parts)}:v=0:a=1[o]",
++                "-map", "[o]", "-codec:a", "libmp3lame", "-q:a", "4", "-f", "mp3", "pipe:1"]
++        r = subprocess.run(cmd, capture_output=True, timeout=90)
++        return r.stdout if r.returncode == 0 else b""
++    finally:
++        import shutil
++        shutil.rmtree(tmp, ignore_errors=True)
++
++
++async def speak(text: str, voice: str = "") -> bytes:
++    """mp3 bytes, or b"" when an offline voice is missing or fails (never raises). Mixed-language text is read
++    piece by piece, each in its own language."""
++    segs = segments(text, voice)
++    if len(segs) <= 1:
++        return await _speak_one(text, language(text, voice))
++    parts = []
++    for lang, seg in segs:
++        b = await _speak_one(seg, lang)
++        if not b:
++            return b""
++        parts.append(b)
++    try:
++        return await asyncio.to_thread(_concat, parts)
++    except Exception as e:      # noqa: BLE001
++        print(f"[voice offline] joining failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
++        return b""
++
++
++async def _speak_one(text: str, lang: str) -> bytes:
++    if lang == "vi" and vieneu_available():
++        try:
++            mp3 = await asyncio.to_thread(_vieneu_sync, text)
++            if mp3:
++                return mp3
++        except Exception as e:      # noqa: BLE001
++            print(f"[voice offline] VieNeu failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
++    if not available(lang):
++        return b""
++    try:
++        return await asyncio.to_thread(_speak_sync, text, lang)
++    except Exception as e:      # noqa: BLE001
++        print(f"[voice offline] {lang} failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
++        return b""
++
++
++def offline_first(online):
++    """A `synth(text, voice)` for voice_note.make: offline voice first, the given online one when it gives nothing."""
++    async def synth(text: str, voice: str) -> bytes:
++        return await speak(text, voice) or await online(text, voice)
++    return synth
++
++
++def install(target: Optional[Path] = None) -> None:
++    """Download the engine and the three voices into `<state>/tts` (needs internet once)."""
++    import urllib.request
++    h = Path(target) if target else home()
++    (h / "voices").mkdir(parents=True, exist_ok=True)
++    subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "--target", str(h / "lib"), "piper-tts"], check=True)
++    for lang, name in VOICES.items():
++        for ext in (".onnx", ".onnx.json"):
++            dst = h / "voices" / (name + ext)
++            if not dst.exists():
++                urllib.request.urlretrieve(_BASE + _PATHS[lang] + name + ext, dst)
++            print(dst, dst.stat().st_size)
++
++
++def set_clone_ref(src: str) -> Path:
++    """Copy the reference recording of the voice to clone into `<state>/tts/ref_giong.wav`."""
++    import shutil
++    s = Path(src)
++    if not s.is_file() or s.stat().st_size <= 2000:
++        raise FileNotFoundError(f"reference recording not found or empty: {src}")
++    dst = home() / "ref_giong.wav"
++    dst.parent.mkdir(parents=True, exist_ok=True)
++    shutil.copyfile(s, dst)
++    return dst
++
++
++if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "install":
++    install()
++elif __name__ == "__main__" and len(sys.argv) > 2 and sys.argv[1] == "clone":
++    print(set_clone_ref(sys.argv[2]))
+diff --git a/server/zalo_audio_reply.py b/server/zalo_audio_reply.py
+new file mode 100644
+index 00000000..1b95bc79
+--- /dev/null
++++ b/server/zalo_audio_reply.py
+@@ -0,0 +1,212 @@
++"""Spoken replies on personal Zalo: turn the bot's answer into an mp3 and send it into the chat.
++
++The mp3 goes out as a playable file through the stock MCP tool `zalo_send_file` (`zalo_cli.send_files`), on the MCP
++process that already holds the Zalo session. Zalo's native voice bubble needs a public URL for the recording, and a
++customer's answer is never published, so the file path is the one used.
++"""
++from __future__ import annotations
++
++import asyncio
++import re
++import tempfile
++import unicodedata
++from pathlib import Path
++
++VOICE = "vi-VN-HoaiMyNeural"
++RATE = "-10%"
++VOICE_ZH = "zh-CN-XiaoxiaoNeural"
++RATE_ZH = "-20%"        # slower for learners
++MAX_CHARS = 700
++FILE_NAME = "Tra loi bang giong noi.mp3"
++
++# What an asker writes when they want to hear the answer, compared after stripping accents (people type without them).
++_VOICE_REQUESTS = ("tin nhan thoai", "nhan thoai", "giong noi", "am thanh", "voice", "audio",
++                   "ghi am", "doc cho", "noi cho", "cho nghe", "bang giong")
++_HAN = re.compile(r"([㐀-鿿豈-﫿]+(?:[\s，。！？、：；,.!?]*[㐀-鿿豈-﫿]+)*)")
++
++
++def _strip_accents(s: str) -> str:
++    s = unicodedata.normalize("NFD", str(s or "").lower()).replace("đ", "d")
++    return "".join(c for c in s if unicodedata.category(c) != "Mn")
++
++
++def asks_for_voice(text: str) -> bool:
++    """True when the asker wants a spoken reply (gates voice replies in group chats)."""
++    t = _strip_accents(text)
++    return any(k in t for k in _VOICE_REQUESTS)
++
++
++_VOICE_BLOCK = re.compile(r"<voice>(.*?)</voice>", re.S | re.I)
++
++
++def split_voice(answer: str) -> tuple:
++    """(text to write, text to say). An answer may carry `<voice>...</voice>`: that part is spoken, the rest is written.
++    No tag: nothing is split and the whole answer is both written and spoken, as before."""
++    spoken = " ".join(" ".join(m.split()) for m in _VOICE_BLOCK.findall(str(answer or ""))).strip()
++    written = re.sub(r"\n{3,}", "\n\n", _VOICE_BLOCK.sub("", str(answer or ""))).strip()
++    return written, spoken
++
++
++def _speakable(text: str) -> str:
++    """Strip markdown marks and links so the voice never reads out symbols."""
++    t = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", str(text or ""))
++    t = re.sub(r"https?://\S+", "", t)
++    t = re.sub(r"[*_#`>|~]+", "", t)
++    return " ".join(t.split())
++
++
++_VI_ONLY = set("ăâêôơưđạảãấầẩẫậắằẳẵặẹẻẽếềểễệịỉĩọỏõốồổỗộớờởỡợụủũứừửữựỳỵỷỹý")
++_PINYIN_SURE = set("āēīōūǖǎěǐǒǔǚǘǜ")           # macron / caron: never Vietnamese
++_PINYIN_WORD = re.compile(r"^[a-zàáèéìíòóùúüāēīōūǖǎěǐǒǔǚǘǜ']+$")
++_SENTENCE = re.compile(r"(?<=[.!?;:])\s+")
++MAX_SEGMENTS = 14
++SLOW_ZH_CHARS = 12        # a short Chinese piece is a word being taught: read it slowly
++
++
++def _han_lang(part: str) -> str:
++    """zh-TW for traditional characters (they do not fit the simplified GB2312 set), zh-CN otherwise."""
++    han = "".join(c for c in part if "㐀" <= c <= "鿿")
++    try:
++        han.encode("gb2312")
++        return "zh-CN"
++    except UnicodeEncodeError:
++        try:
++            han.encode("big5")
++            return "zh-TW"
++        except UnicodeEncodeError:
++            return "zh-CN"
++
++
++def _drop_pinyin(text: str) -> str:
++    """Remove pinyin runs ("zǎoshang hǎo") from text that sits next to the Hanzi they spell: the Chinese voice already
++    says the characters correctly, and a Vietnamese voice reading pinyin letters teaches a wrong pronunciation."""
++    words = text.split(" ")
++    low = [w.strip("()[]\"'“”,.;:!?/").lower() for w in words]
++    sure = [bool(w) and any(c in _PINYIN_SURE for c in w) and not any(c in _VI_ONLY for c in w) for w in low]
++    drop = list(sure)
++    for step in (1, -1):                      # tone-marked neighbours of a sure pinyin word belong to the same run
++        rng = range(len(words)) if step == 1 else range(len(words) - 1, -1, -1)
++        for i in rng:
++            j = i - step
++            if (not drop[i] and 0 <= j < len(words) and drop[j] and low[i] and _PINYIN_WORD.match(low[i])
++                    and not any(c in _VI_ONLY for c in low[i]) and any(c in "àáèéìíòóùú" for c in low[i])):
++                drop[i] = True
++    return " ".join(w for w, d in zip(words, drop) if not d)
++
++
++def _latin_lang(sentence: str) -> str:
++    """vi when the sentence carries any Vietnamese letter; en for a plain-ASCII sentence of two words or more."""
++    low = sentence.lower()
++    if any(c in _VI_ONLY or c in "àáèéìíòóùú" for c in low):
++        return "vi"
++    return "en" if len(re.findall(r"[a-z]{2,}", low)) >= 2 else "vi"
++
++
++def _segments(clean: str) -> list:
++    """[(text, lang)] with lang one of vi, en, zh-CN, zh-TW: each piece is read by the Google voice of its own language.
++    A Vietnamese voice skips Hanzi and mangles English, which leaves holes in a trilingual (Viet-English-Chinese) answer."""
++    has_han = bool(_HAN.search(clean))
++    out = []
++    for i, part in enumerate(_HAN.split(clean)):
++        if not part or not part.strip():
++            continue
++        if i % 2 == 1:
++            out.append((part.strip(), _han_lang(part)))
++            continue
++        if has_han:
++            part = _drop_pinyin(part)
++        for sentence in _SENTENCE.split(part):
++            s = sentence.strip(" ()[]-,")
++            if re.search(r"\w", s):
++                out.append((s, _latin_lang(s)))
++    merged = []
++    for text, lang in out:
++        if merged and merged[-1][1] == lang and not lang.startswith("zh"):
++            merged[-1] = (merged[-1][0] + " " + text, lang)
++        else:
++            merged.append((text, lang))
++    return merged[:MAX_SEGMENTS] or [(clean, "vi")]
++
++
++async def _edge(text: str, voice: str, rate: str) -> bytes:
++    import edge_tts
++
++    audio = bytearray()
++    async for chunk in edge_tts.Communicate(text, voice, rate=rate).stream():
++        if chunk.get("type") == "audio":
++            audio.extend(chunk.get("data") or b"")
++    return bytes(audio)
++
++
++def _gtts_mp3(text: str, lang: str) -> bytes:
++    import io
++    from gtts import gTTS
++
++    buf = io.BytesIO()
++    slow = lang.startswith("zh") and len(text) <= SLOW_ZH_CHARS
++    gTTS(text, lang=lang, slow=slow).write_to_fp(buf)
++    return buf.getvalue()
++
++
++_EDGE_VOICES = {"vi": (VOICE, RATE), "en": ("en-US-AriaNeural", "-10%"),
++                "zh-CN": (VOICE_ZH, RATE_ZH), "zh-TW": ("zh-TW-HsiaoChenNeural", RATE_ZH)}
++
++
++async def make_mp3(text: str) -> bytes:
++    """Google Translate's TTS first (owner's choice, 2026-11-12: its Mandarin follows the standard pinyin reading), one
++    voice per language piece (vi, en, zh-CN, zh-TW); Edge TTS voices when Google returns no audio."""
++    clean = _speakable(text)[:MAX_CHARS]
++    if not clean:
++        raise ValueError("empty voice reply")
++    parts = _segments(clean)
++    # Vietnamese pieces are read by VieNeu (the owner's cloned voice when its reference recording is set up, see
++    # `voice_offline.clone_ref`): no tokens, no internet. English and Chinese pieces keep their own voices. Anything
++    # VieNeu cannot do falls through to the online voices below.
++    audio = bytearray()
++    try:
++        import voice_offline
++        pieces, used_clone = [], False
++        for part, lang in parts:
++            b = await voice_offline.speak_vi_clone(part) if lang == "vi" else b""
++            used_clone = used_clone or bool(b)
++            pieces.append(b or await asyncio.to_thread(_gtts_mp3, part, lang))
++        if used_clone:
++            # Pieces come from engines with different sample rates: join them properly, not byte by byte.
++            joined = await asyncio.to_thread(voice_offline._concat, pieces) if len(pieces) > 1 else pieces[0]
++            audio.extend(joined or b"".join(pieces))
++        else:
++            audio.extend(b"".join(pieces))
++    except Exception:
++        audio = bytearray()
++    if not audio:
++        try:
++            for part, lang in parts:
++                audio.extend(await asyncio.to_thread(_gtts_mp3, part, lang))
++        except Exception:
++            audio = bytearray()
++    if not audio:
++        for part, lang in parts:
++            voice, rate = _EDGE_VOICES[lang]
++            audio.extend(await _edge(part, voice, rate))
++    if not audio:
++        raise RuntimeError("text to speech returned no audio")
++    return bytes(audio)
++
++
++async def send_audio_file(conn: dict, thread_id: str, chat_type: str, text: str) -> tuple[bool, str]:
++    """Speak `text` and send the mp3. Returns the real send result; the recording is deleted right after."""
++    import zalo_cli
++
++    try:
++        home = zalo_cli.home_of(conn)
++        if not home:
++            return False, "no Zalo session folder"
++        audio = await make_mp3(text)
++        with tempfile.TemporaryDirectory(prefix="javis-zalo-audio-") as tmp:
++            path = Path(tmp) / FILE_NAME
++            path.write_bytes(audio)
++            ok, _data, err = await zalo_cli.send_files(str(conn.get("id") or ""), home, str(thread_id), [path],
++                                                       1 if chat_type == "group" else 0)
++        return (True, "") if ok else (False, str(err or "MCP did not confirm")[:300])
++    except Exception as exc:
++        return False, f"{type(exc).__name__}: {exc}"
+diff --git a/server/zalo_cli.py b/server/zalo_cli.py
+index adb2b0dc..73c456bf 100644
+--- a/server/zalo_cli.py
++++ b/server/zalo_cli.py
+@@ -459,3 +459,38 @@ async def send_files(conn_id: str, home: str, thread_id: str, files: List[Path],
+         return True, data, ""
+     finally:
+         shutil.rmtree(box, ignore_errors=True)
++
++
++SEND_VOICE_TOOL = "zalo_send_voice"
++
++
++async def send_voice(conn_id: str, home: str, thread_id: str, audio: Path, thread_type: int = 0) -> Tuple[bool, Any, str]:
++    """Send one audio file as a real Zalo voice message (a playable bubble) with MCP tool `zalo_send_voice`.
++    Same outbox rule as `send_files`. A javis-zalo without that tool comes back as `(False, None, reason)` and the
++    caller falls back to a plain file."""
++    try:
++        import zalo_personal_channel
++    except Exception as e:      # noqa: BLE001
++        return False, None, f"cannot load the Zalo channel ({type(e).__name__})"
++    conn = zalo_personal_channel.ket_noi_theo_id(conn_id)
++    if not conn:
++        return False, None, f"Zalo connection '{conn_id}' is not on"
++    box = outbox_dir(home) / uuid.uuid4().hex
++    try:
++        try:
++            box.mkdir(parents=True)
++            dst = box / Path(audio).name
++            shutil.copyfile(audio, dst)
++        except OSError as e:
++            return False, None, f"cannot copy the audio into the Zalo outbox ({e})"
++        args = {"threadId": str(thread_id), "threadType": int(thread_type), "path": str(dst)}
++        try:
++            data = await zalo_personal_channel._goi(conn, SEND_VOICE_TOOL, args)
++        except Exception as e:      # noqa: BLE001
++            why = re.sub(r"^\s*Error:\s*", "", str(e)).strip() or type(e).__name__
++            return False, None, why
++        if not isinstance(data, dict) or not data.get("success"):
++            return False, None, f"odd MCP answer: {json.dumps(data, ensure_ascii=False)[:200]}"
++        return True, data, ""
++    finally:
++        shutil.rmtree(box, ignore_errors=True)
+diff --git a/server/zalo_personal_channel.py b/server/zalo_personal_channel.py
+index bd495d78..cd30ed5e 100644
+--- a/server/zalo_personal_channel.py
++++ b/server/zalo_personal_channel.py
+@@ -974,7 +974,8 @@ def _ghi_lo(conn: dict, tin: list, ten: dict) -> tuple:
+                 attach_echo_id(conn["id"], ev)
+                 trung += 1
+                 continue
+-            if (ev.get("message_type") == "image" and _la_vong_anh(conn["id"], ev["external_chat_id"])) or (
++            if (ev.get("message_type") in ("image", "file")       # bot's voice reply goes out as an mp3 file
++                    and _la_vong_anh(conn["id"], ev["external_chat_id"])) or (
+                     _is_link_echo(conn["id"], ev["external_chat_id"], ev, m)):
+                 attach_echo_id(conn["id"], ev)
+                 trung += 1
+@@ -1114,6 +1115,18 @@ def mo_ta_loi(raw: str, cap: int = 300) -> str:
+ 
+ async def _vong() -> None:
+     print("[zalo-personal] vòng đọc bắt đầu", file=sys.stderr)
++    try:        # voice messages that play in the chat: re-add the tool an update may have wiped (zalo_voice_tool.py)
++        import config as _cfg
++        import zalo_voice_tool
++        for f in zalo_voice_tool.ensure(_cfg.STATE_DIR):
++            print(f"[zalo-personal] added zalo_send_voice to {f}", file=sys.stderr)
++    except Exception:       # noqa: BLE001
++        pass
++    try:        # load the VieNeu voice model now, so the first voice reply does not wait for it
++        import voice_offline
++        voice_offline.warm_soon()
++    except Exception:       # noqa: BLE001
++        pass
+     while not _stop:
+         if _WAKE is not None:
+             _WAKE.clear()       # before the pass: whatever calls wake() from here on is seen by the next sleep
+diff --git a/server/zalo_voice_reminder.py b/server/zalo_voice_reminder.py
+new file mode 100644
+index 00000000..cad27bc4
+--- /dev/null
++++ b/server/zalo_voice_reminder.py
+@@ -0,0 +1,304 @@
++"""Zalo voice reminders: a reminder that tags the owner by name, "rings" them and speaks the note.
++
++The owner (2026-11-16): when I book something by Zalo, tag my name at that time, make a virtual call with a
++voice message saying what it is, repeat it as often as I asked, and learn how I write Vietnamese so you do not
++misread my slips. Names: the one a person set FOR THEMSELVES on Zalo is the official one, never the nickname
++(alias) the owner saved for them.
++
++What this module owns (no network, no engine, so it is testable on its own):
++
++* `canonical_name`  - which of Zalo's several names to use.
++* the Vietnamese lexicon - built-in chat shorthand ("ko", "dc", "7h", "a Thế") plus what the owner taught,
++  kept in the brain, so a voice note says "không" and not "ka-o".
++* `repeat_preset`   - "nhẹ / vừa / gắt" turned into a repeat interval and a number of runs.
++* `deliver`         - one firing: ring line (tag), voice note, written line. The senders are injected.
++
++A real Zalo voice call is NOT possible: the unofficial Zalo API behind javis-zalo has no call tool. The
++"virtual call" is a tagged ring message plus a spoken note, which still makes the phone buzz and say who is
++calling. When javis-zalo gains a call tool, only `deliver` changes.
++"""
++from __future__ import annotations
++
++import asyncio
++import json
++import os
++import re
++import time
++from pathlib import Path
++from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
++
++LEXICON_FILE = Path("Javis") / "zalo_vi_lexicon.json"
++MEMORY_FACT = Path("memory") / "facts" / "vi-speech-lexicon.md"
++MEMORY_INDEX = Path("memory") / "MEMORY.md"
++MAX_ENTRIES = 300
++MAX_TOKEN = 40
++MAX_NAME = 80
++
++# Zalo names, most to least trusted. `zaloName` is what the person typed into their own profile; `displayName`
++# is the same on every account we saw. `alias` is the nickname the VIEWER saved, so it is never the official one.
++_SELF_SET_KEYS = ("zaloName", "zalo_name", "displayName", "display_name")
++_ALIAS_KEYS = ("alias", "nickname", "contactName", "contact_name")
++
++
++def _clean(s: Any, cap: int = MAX_NAME) -> str:
++    return " ".join(str(s or "").split())[:cap]
++
++
++def canonical_name(info: Any) -> str:
++    """The name to use for a person: the one they set for themselves. The owner's own nickname for them
++    (`alias`) only when nothing else exists, so a tag never stays empty."""
++    d = info if isinstance(info, dict) else {}
++    for k in _SELF_SET_KEYS:
++        v = _clean(d.get(k))
++        if v:
++            return v
++    for k in _ALIAS_KEYS:
++        v = _clean(d.get(k))
++        if v:
++            return v
++    return ""
++
++
++# ── Vietnamese lexicon ────────────────────────────────────────────────────────────────────────────
++# Shorthand people really type. Kept small and safe: each entry is a whole token that is never a normal word.
++BUILTIN: Dict[str, str] = {
++    "ko": "không", "hok": "không", "khum": "không", "hong": "không", "hông": "không",
++    "dc": "được", "đc": "được", "dk": "được", "đk": "được",
++    "j": "gì", "vs": "với", "mk": "mình", "ngta": "người ta", "bik": "biết", "ntn": "như thế nào",
++    "bn": "bao nhiêu", "ae": "anh em", "trc": "trước", "tks": "cảm ơn", "thks": "cảm ơn",
++    "nhe": "nhé", "zậy": "vậy", "zui": "vui", "zô": "vào", "mn": "mọi người", "đt": "điện thoại",
++    "sdt": "số điện thoại", "cty": "công ty",
++}
++
++_VI_CHAR = re.compile(r"[ăâđêôơưạảấầẩẫậắằẳẵặẹẻẽếềểễệỉịọỏốồổỗộớờởỡợụủứừửữựỳỵỷỹáàãéèíìóòõúùýÁÀÃÉÈÍÌÓÒÕÚÙÝ]")
++# "a Thế", "c Lan", "e Nam": one-letter pronoun in front of a capitalised name.
++_PRONOUN = re.compile(r"(?<![\w@])([aceACE])(?=\s+[A-ZĐÀÁẢÃẠĂÂÈÉẺẼẸÊÌÍỈĨỊÒÓỎÕỌÔƠÙÚỦŨỤƯỲÝỶỸỴ][\wÀ-ỹ]*)")
++_PRON_WORD = {"a": "anh", "c": "chị", "e": "em"}
++_CLOCK = re.compile(r"\b(\d{1,2})\s?h(?:(\d{1,2})\b)?(?![\wÀ-ỹ])")
++
++
++def _lex_path(root: str) -> Path:
++    return Path(root) / LEXICON_FILE
++
++
++def load(root: str) -> Dict[str, dict]:
++    """The learned entries `{wrong: {right, count, updated}}`, {} when none or unreadable."""
++    if not root:
++        return {}
++    try:
++        d = json.loads(_lex_path(root).read_text(encoding="utf-8"))
++        e = d.get("entries") if isinstance(d, dict) else None
++        return {str(k): v for k, v in e.items() if isinstance(v, dict) and v.get("right")} if isinstance(e, dict) else {}
++    except (OSError, ValueError):
++        return {}
++
++
++def _write_atomic(path: Path, text: str) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    tmp = path.with_suffix(path.suffix + ".tmp")
++    tmp.write_text(text, encoding="utf-8")
++    os.replace(tmp, path)
++
++
++def learn(root: str, wrong: str, right: str) -> bool:
++    """Remember that the owner's `wrong` means `right`. False when either side is unusable or they are the same."""
++    w, r = _clean(wrong, MAX_TOKEN).lower(), _clean(right, MAX_TOKEN * 2)
++    if not root or not w or not r or w == r.lower() or "\n" in w:
++        return False
++    entries = load(root)
++    if w not in entries and len(entries) >= MAX_ENTRIES:
++        return False
++    cur = entries.get(w) or {}
++    entries[w] = {"right": r, "count": int(cur.get("count") or 0) + 1, "updated": int(time.time())}
++    _write_atomic(_lex_path(root), json.dumps({"entries": entries}, ensure_ascii=False, indent=2))
++    sync_memory(root, entries)
++    return True
++
++
++def forget(root: str, wrong: str) -> bool:
++    entries = load(root)
++    if _clean(wrong, MAX_TOKEN).lower() not in entries:
++        return False
++    entries.pop(_clean(wrong, MAX_TOKEN).lower())
++    _write_atomic(_lex_path(root), json.dumps({"entries": entries}, ensure_ascii=False, indent=2))
++    sync_memory(root, entries)
++    return True
++
++
++# The owner writes "A" is "B" in quotes to teach a meaning: `"ko" là "không"`, `ý anh là "mai", không phải "may"`.
++_TEACH = re.compile(r"[\"“'‘]([^\"”'’\n]{1,40})[\"”'’]\s*(?:là|nghĩa là|tức là|ý là|=|->|→)\s*[\"“'‘]([^\"”'’\n]{1,80})[\"”'’]", re.I)
++_TEACH_NOT = re.compile(r"ý\s+(?:anh|tôi|mình)\s+là\s+[\"“'‘]([^\"”'’\n]{1,80})[\"”'’][\s,;]*(?:chứ\s+)?(?:không|chứ không)\s+phải\s+[\"“'‘]([^\"”'’\n]{1,40})[\"”'’]", re.I)
++
++
++def detect_correction(text: str) -> List[Tuple[str, str]]:
++    """`[(wrong, right)]` the owner just taught in one message. Needs quotes, so ordinary speech never teaches by accident."""
++    out: List[Tuple[str, str]] = []
++    t = str(text or "")
++    for m in _TEACH_NOT.finditer(t):
++        out.append((m.group(2).strip(), m.group(1).strip()))
++    for m in _TEACH.finditer(t):
++        pair = (m.group(1).strip(), m.group(2).strip())
++        if pair not in out:
++            out.append(pair)
++    return out
++
++
++def normalize(text: str, root: str = "") -> str:
++    """The owner's text with shorthand spelled out, for the voice and for the written line. Learned entries win over the
++    built-in ones. Text with no Vietnamese in it (and no learned hit) is returned as it came."""
++    t = str(text or "")
++    if not t:
++        return t
++    table = dict(BUILTIN)
++    for k, v in load(root).items():
++        table[k] = str(v.get("right") or "")
++    viet = bool(_VI_CHAR.search(t)) or any(re.search(rf"(?<![\w]){re.escape(k)}(?![\w])", t, re.I) for k in table)
++    if not viet:
++        return t
++
++    def word(m: "re.Match") -> str:
++        tok = m.group(0)
++        return table.get(tok.lower(), tok)
++
++    if table:
++        keys = sorted(table, key=len, reverse=True)
++        t = re.sub(r"(?<![\w@/.\-])(" + "|".join(re.escape(k) for k in keys) + r")(?![\w])", word, t, flags=re.I)
++    t = _PRONOUN.sub(lambda m: _PRON_WORD[m.group(1).lower()], t)
++    t = _CLOCK.sub(lambda m: f"{m.group(1)} giờ" + (f" {int(m.group(2))}" if m.group(2) else ""), t)
++    return t
++
++
++def sync_memory(root: str, entries: Optional[Dict[str, dict]] = None) -> None:
++    """Mirror the lexicon as a memory fact, so the model reads it with the rest of the brain memory. Best effort."""
++    try:
++        entries = load(root) if entries is None else entries
++        fact = Path(root) / MEMORY_FACT
++        idx = Path(root) / MEMORY_INDEX
++        line = "- [Cách anh gõ tiếng Việt](facts/vi-speech-lexicon.md) - từ gõ tắt hoặc gõ sai và nghĩa đúng, đọc trước khi hiểu lệnh Zalo"
++        if not entries:
++            fact.unlink(missing_ok=True)
++            if idx.exists():
++                keep = [x for x in idx.read_text(encoding="utf-8").splitlines() if "vi-speech-lexicon.md" not in x]
++                _write_atomic(idx, "\n".join(keep) + "\n")
++            return
++        rows = "\n".join(f"- \"{k}\" nghĩa là \"{v['right']}\"" for k, v in sorted(entries.items()))
++        body = ("---\ntype: preference\ncreated: " + time.strftime("%Y-%m-%d") + "\nupdated: " + time.strftime("%Y-%m-%d") +
++                "\n---\nCách chủ viết tiếng Việt (gõ tắt, gõ sai) và nghĩa đúng. Dùng khi hiểu lệnh, hẹn giờ và tin thoại.\n\n" +
++                rows + "\n\n**Vì sao:** chủ dặn Javis học cách chủ nói để không hiểu sai nghĩa.\n"
++                "**Áp dụng:** đổi theo bảng này trước khi hiểu câu; chủ chỉnh thêm thì ghi tiếp.\n")
++        _write_atomic(fact, body)
++        text = idx.read_text(encoding="utf-8") if idx.exists() else ""
++        if "vi-speech-lexicon.md" not in text:
++            _write_atomic(idx, (text.rstrip("\n") + "\n" if text.strip() else "") + line + "\n")
++    except OSError:
++        pass
++
++
++# ── Repetition ────────────────────────────────────────────────────────────────────────────────────
++# (repeat every N minutes, number of runs). One run is a plain reminder.
++PRESETS: Dict[str, Tuple[int, int]] = {
++    "nhe": (0, 1), "light": (0, 1),
++    "vua": (10, 3), "medium": (10, 3),
++    "gat": (5, 6), "urgent": (5, 6), "khan": (3, 10),
++}
++
++
++def _fold(s: str) -> str:
++    import unicodedata
++    s = str(s or "").strip().lower().replace("đ", "d")
++    return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
++
++
++def repeat_preset(level: Any) -> Tuple[int, int]:
++    """`(repeat_min, max_runs)` for a level word ("nhẹ", "vừa", "gắt", "khẩn", or English). Unknown: one run."""
++    return PRESETS.get(_fold(level), (0, 1))
++
++
++# ── Target and delivery ───────────────────────────────────────────────────────────────────────────
++def clean_target(z: Any) -> Optional[dict]:
++    """The Zalo target stored on a reminder, or None when it cannot be delivered (no thread id)."""
++    if not isinstance(z, dict):
++        return None
++    thread = re.sub(r"\D", "", str(z.get("thread") or z.get("threadId") or ""))[:25]
++    if len(thread) < 3:
++        return None
++    t = 1 if str(z.get("type") if z.get("type") is not None else z.get("threadType", 0)).strip() in ("1", "group") else 0
++    uid = re.sub(r"\D", "", str(z.get("uid") or ""))[:25]
++    return {"conn": _clean(z.get("conn") or z.get("connection"), 80), "thread": thread, "type": t, "uid": uid,
++            "name": canonical_name(z) or _clean(z.get("name")),
++            "voice": z.get("voice") is not False, "ring": z.get("ring") is not False,
++            "remind": z.get("remind") is not False}
++
++
++def spoken_line(name: str, text: str, root: str = "") -> str:
++    """What the voice note says: the name first, then the note with shorthand spelled out."""
++    body = normalize(text, root).strip().rstrip(".")
++    return (f"{name} ơi, " if name else "") + (body[:1].lower() + body[1:] if body else "tới giờ rồi")
++
++
++def ring_line(name: str, group: bool) -> str:
++    """The virtual call line. In a group the name becomes a real Zalo tag (the sender adds `@name`), in a private chat the name is plain text."""
++    who = f"@{name}" if (group and name) else name
++    return (who + " " if who else "") + "📞 Javis đang gọi, nghe tin thoại bên dưới nhé"
++
++
++Send = Callable[..., Awaitable[Tuple[bool, str]]]
++
++
++def reminder_title(text: str, root: str = "") -> str:
++    """The title of the reminder that appears in the Zalo chat: the note, spelled out, one line, never starting with a
++    dash (the CLI would read it as a flag)."""
++    t = " ".join(normalize(text, root).split()).lstrip("-– ")
++    return t[:120] or "Nhắc hẹn"
++
++
++async def deliver(target: dict, text: str, *, send_text: Send, send_voice: Optional[Send] = None,
++                  make_voice: Optional[Callable[[str], Awaitable[str]]] = None, root: str = "",
++                  send_reminder: Optional[Callable[[str], Awaitable[Tuple[bool, str]]]] = None) -> Tuple[bool, str]:
++    """One firing. `send_text(text, mention=None)`, `send_voice(path)`, `make_voice(text) -> path or ""` and
++    `send_reminder(title)` (the reminder entry inside the Zalo chat) are injected.
++
++    Order: ring line (tag), voice note, written line, Zalo reminder entry. The ring line and the written line carry
++    the message, so a failure of either is a failure; a missing voice note or Zalo reminder only adds a warning,
++    the reminder still arrived."""
++    tg = clean_target(target)
++    if not tg:
++        return False, "no Zalo thread to send to"
++    group = tg["type"] == 1
++    name = tg["name"]
++    mention = {"uid": tg["uid"], "name": name} if group and tg["uid"] and name else None
++    notes: List[str] = []
++    if tg["ring"]:
++        ok, err = await send_text(ring_line(name, group), mention)
++        if not ok:
++            return False, f"ring: {err}"
++    if tg["voice"] and make_voice and send_voice:
++        path = ""
++        line = spoken_line(name, text, root)
++        for attempt in range(3):    # the free voice service sometimes answers with no audio; ask again
++            try:
++                path = await make_voice(line)
++                notes = []
++            except Exception as e:      # noqa: BLE001 - a voice failure must not lose the reminder
++                path, notes = "", [f"voice: {type(e).__name__}: {e}"[:160]]
++            if path:
++                break
++            if attempt < 2:
++                await asyncio.sleep(1.5)
++        if path:
++            vok, verr = await send_voice(path)
++            if not vok:
++                notes.append(f"voice not sent: {verr}"[:160])
++        elif not notes:
++            notes.append("voice: no audio")
++    ok, err = await send_text("⏰ " + normalize(text, root).strip(), None if tg["ring"] else mention)
++    if not ok:
++        return False, f"text: {err}"
++    if tg["remind"] and send_reminder:
++        try:
++            rok, rerr = await send_reminder(reminder_title(text, root))
++        except Exception as e:      # noqa: BLE001 - the reminder entry is an extra
++            rok, rerr = False, f"{type(e).__name__}: {e}"
++        if not rok:
++            notes.append(f"zalo reminder not created: {rerr}"[:160])
++    return True, "; ".join(notes)
+diff --git a/server/zalo_voice_tool.py b/server/zalo_voice_tool.py
+new file mode 100644
+index 00000000..ffa1eca0
+--- /dev/null
++++ b/server/zalo_voice_tool.py
+@@ -0,0 +1,90 @@
++"""Give every installed javis-zalo a `zalo_send_voice` MCP tool (2026-11-16).
++
++javis-zalo (pinned upstream) sends audio only as a file card. A voice message that plays in the chat needs the file
++uploaded through the live connection, then `sendVoice` with the link Zalo returns. Until upstream ships that tool,
++Javis adds it to each installed copy: the bundled one under `<state>/tools` and the npx copies each connection keeps
++under `<state>/connector-home`. An update reinstalls those copies, so this runs at every start of the Zalo loop and
++again whenever a send finds the tool missing. It is idempotent and leaves a copy it does not recognise untouched.
++"""
++from __future__ import annotations
++
++import os
++from pathlib import Path
++from typing import List
++
++MARK = "zalo_send_voice"
++_IMPORT_OLD = 'import { OUTBOX_DIR } from "../core/send-files.js";'
++_IMPORT_NEW = 'import { OUTBOX_DIR, filesInside } from "../core/send-files.js";'
++_ANCHOR = "    // --- zalo_send_file ---"
++
++TOOL_JS = '''    // --- zalo_send_voice (added by Javis, server/zalo_voice_tool.py) ---
++    server.registerTool(
++        "zalo_send_voice",
++        {
++            title: "Send Zalo Voice Message",
++            description: "Send an audio file from the outbox folder as a Zalo VOICE message. threadType: 0=DM, 1=Group.",
++            inputSchema: z.object({
++                threadId: z.string(),
++                path: z.string(),
++                threadType: z.number().int().min(0).max(1).default(THREAD_USER),
++            }),
++        },
++        async (args) => {
++            try {
++                const a = live();
++                const [file] = filesInside([args.path], OUTBOX_DIR);
++                const up = await Promise.race([
++                    a.uploadAttachment([file], args.threadId, Number(args.threadType)),
++                    new Promise((_, rej) => setTimeout(() => rej(new Error("Zalo did not confirm the upload in 60s")), 60000)),
++                ]);
++                const url = up?.[0]?.fileUrl;
++                if (!url) throw new Error("Zalo gave no file link: " + JSON.stringify(up).slice(0, 200));
++                const res = await a.sendVoice({ voiceUrl: url }, args.threadId, Number(args.threadType));
++                return ok({ success: true, voiceUrl: url, result: res });
++            } catch (e) {
++                console.error("[mcp-tools] zalo_send_voice error:", e.message);
++                return err(e.message);
++            }
++        },
++    );
++
++'''
++
++
++def patch_text(src: str) -> str:
++    """The file with the tool added, or "" when it already has it or does not look like a known mcp-tools.js."""
++    if MARK in src or _IMPORT_OLD not in src or _ANCHOR not in src:
++        return ""
++    src = src.replace(_IMPORT_OLD, _IMPORT_NEW, 1)
++    i = src.index(_ANCHOR)
++    return src[:i] + TOOL_JS + src[i:]
++
++
++def candidates(state_dir) -> List[Path]:
++    """Every javis-zalo `src/mcp/mcp-tools.js` under `<state>/tools` and `<state>/connector-home` (hidden npx caches
++    included; the rest of the state folder, brains above all, is never walked)."""
++    out: List[Path] = []
++    for top in (Path(state_dir) / "tools", Path(state_dir) / "connector-home"):
++        if not top.is_dir():
++            continue
++        for d, _subs, files in os.walk(top):
++            if "mcp-tools.js" in files and d.replace("\\", "/").endswith("node_modules/javis-zalo/src/mcp"):
++                out.append(Path(d) / "mcp-tools.js")
++    return out
++
++
++def ensure(state_dir) -> List[str]:
++    """Add the tool wherever it is missing. Returns the files changed; never raises."""
++    changed: List[str] = []
++    try:
++        for f in candidates(state_dir):
++            try:
++                new = patch_text(f.read_text(encoding="utf-8"))
++                if new:
++                    f.write_text(new, encoding="utf-8")
++                    changed.append(str(f))
++            except OSError:
++                continue
++    except Exception:       # noqa: BLE001 - a failed patch only means voice goes as a file
++        pass
++    return changed
+diff --git a/system/plugins/javis-schedule/plugin.py b/system/plugins/javis-schedule/plugin.py
+index c3cc65e0..ec48c8a8 100644
+--- a/system/plugins/javis-schedule/plugin.py
++++ b/system/plugins/javis-schedule/plugin.py
+@@ -544,6 +544,21 @@ async def _do_create(vault_root: str, args: dict) -> str:
+         payload["speak"] = True
+     if args.get("call"):
+         payload["call"] = True
++    zalo = args.get("zalo")
++    if isinstance(zalo, dict):
++        # 2026-11-16: tag the person, "ring" and speak the note on Zalo (server/zalo_voice_reminder.py).
++        payload["zalo"] = zalo
++        if args.get("max_runs"):
++            payload["max_runs"] = args["max_runs"]
++        elif str(args.get("intensity") or "").strip():
++            try:
++                import zalo_voice_reminder as zvr
++                every, runs = zvr.repeat_preset(args.get("intensity"))
++            except Exception:
++                every, runs = 0, 1
++            if runs > 1:
++                payload["max_runs"] = runs
++                payload.setdefault("repeat_min", every)
+     if _turn_bot():
+         payload["bot_id"] = _turn_bot()
+     if assistant:
+@@ -739,7 +754,26 @@ async def javis_schedule(args: dict, cctx) -> str:
+         return await _do_update(vault_root, args)
+     if op == "cancel":
+         return await _do_cancel(vault_root, args)
+-    return f"ERROR: op không hợp lệ: {op!r} (dùng create|list|update|cancel)"
++    if op == "lexicon":
++        return _do_lexicon(vault_root, args)
++    return f"ERROR: op không hợp lệ: {op!r} (dùng create|list|update|cancel|lexicon)"
++
++
++def _do_lexicon(vault_root: str, args: dict) -> str:
++    """How the owner writes Vietnamese (2026-11-16). `wrong` + `right` teaches a meaning, `wrong` alone with
++    `forget` removes one, nothing else lists them. Used by Zalo reminders to read and speak the owner's words right."""
++    try:
++        import zalo_voice_reminder as zvr
++    except Exception as e:      # noqa: BLE001
++        return f"ERROR: lexicon unavailable ({type(e).__name__})"
++    wrong, right = str(args.get("wrong") or "").strip(), str(args.get("right") or "").strip()
++    if wrong and args.get("forget"):
++        return f"Forgot {wrong!r}." if zvr.forget(vault_root, wrong) else f"ERROR: {wrong!r} was not in the lexicon."
++    if wrong and right:
++        return (f"Learned: {wrong!r} means {right!r}. Zalo reminders now read it that way.") if zvr.learn(vault_root, wrong, right) \
++            else "ERROR: could not learn that pair (empty, identical, or the lexicon is full)."
++    rows = zvr.load(vault_root)
++    return "\n".join(f"{k} -> {v['right']}" for k, v in sorted(rows.items())) or "The lexicon has no learned words yet."
+ 
+ 
+ def register(ctx) -> None:
+@@ -770,8 +804,14 @@ def register(ctx) -> None:
+         schema={
+             "type": "object",
+             "properties": {
+-                "op": {"type": "string", "enum": ["create", "list", "update", "cancel"],
+-                       "description": ("create = tạo việc mới (cần name/prompt/schedule); "
++                "wrong": {"type": "string",
++                          "description": "op=lexicon: a word the owner wrote or said that Javis must read differently."},
++                "right": {"type": "string", "description": "op=lexicon: what the owner really meant by `wrong`."},
++                "forget": {"type": "boolean", "description": "op=lexicon with `wrong`: remove that entry."},
++                "op": {"type": "string", "enum": ["create", "list", "update", "cancel", "lexicon"],
++                       "description": ("lexicon = teach how the owner writes Vietnamese (wrong+right), or list what was "
++                                       "taught: do it whenever the owner corrects a word you misread; "
++                                       "create = tạo việc mới (cần name/prompt/schedule); "
+                                        "list = liệt kê MỌI việc đang có, cả loop lẫn nhắc hẹn; "
+                                        "update = sửa việc đã có theo id (truyền name/prompt/"
+                                        "schedule - trường nào không truyền thì giữ nguyên); "
+@@ -811,6 +851,19 @@ def register(ctx) -> None:
+                 "call": {"type": "boolean",
+                          "description": ("true = tới giờ Javis GỌI ĐẾN như cuộc gọi trên trang Javis đang mở, user bấm "
+                                          "Nghe thì Javis đọc kết quả và nói chuyện tiếp (\"7h gọi đọc báo cáo cho anh\").")},
++                "zalo": {"type": "object",
++                         "description": ("Zalo reminder (op=create, notify_only=true): at the time Javis tags the person, sends a "
++                                         "tagged call-style line, a voice message of the note and the written note. Fields: "
++                                         "thread (chat id), type (0 person, 1 group), name, uid (for the tag in a group), "
++                                         "conn (Zalo account id or its name on the Connections page, e.g. Crewvn; optional when only one). It also "
++                                         "creates a reminder entry inside the Zalo chat. `name` MUST be the name the person "
++                                         "set for THEMSELVES on Zalo, never the nickname the owner saved for them. Write the "
++                                         "prompt with the owner's shorthand already read correctly.")},
++                "intensity": {"type": "string",
++                              "description": ("With zalo: how hard to repeat. light (once), medium (every 10 min, 3 times), "
++                                              "urgent (every 5 min, 6 times). Use max_runs for an exact count.")},
++                "max_runs": {"type": "integer",
++                             "description": "With zalo and a repeating schedule: stop after this many runs."},
+                 "remember_last": {"type": "boolean",
+                                   "description": ("true = mỗi lần chạy nhận lại kết quả lần trước (theo dõi, "
+                                                   "báo cái mới). Chỉ cho nhắc hẹn tự làm, không cho loop.")},
