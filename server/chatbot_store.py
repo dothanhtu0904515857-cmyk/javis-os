@@ -76,6 +76,33 @@ KENH_NGUON_TOKEN = {k: (channels.spec(k).lay_token if channels.spec(k) else "") 
 # giá" (0.64.82): tag/reply vẫn trả lời, còn tin khác thì bot tự xem có phải câu hỏi tài liệu của
 # nó trả lời được không, xem `chatbot_tu_dong`.
 REPLY_WHEN = ("mention", "always", "auto")
+# Voice replies on personal Zalo: "audio_file" = the bot also sends its answer as a spoken mp3 (always when the customer sent
+# a voice message or asked to hear it; in private chats every answer). Restored 2026-11-12: an update had dropped this key.
+VOICE_REPLY = ("off", "audio_file")
+
+
+def clean_group_modes(v: Any) -> dict:
+    """`group_modes`: {group id: reply mode} (2026-11-12). One group can run in a different mode than the bot, e.g. a small
+    training group where the bot may decide for itself whether to answer ("always": every message reaches the Agent, which
+    answers or stays silent) while the bot stays on "mention" everywhere else. Unknown modes and ids are dropped."""
+    if not isinstance(v, dict):
+        return {}
+    out = {}
+    for k, m in v.items():
+        k = str(k or "").strip()
+        if k and " " not in k and m in REPLY_WHEN and len(out) < 50:
+            out[k] = m
+    return out
+
+
+def with_group_mode(cfg: dict, meta: Optional[dict]) -> dict:
+    """`cfg` itself, or a COPY whose `reply_when` is this group's own mode when the owner set one for it (`group_modes`).
+    Groups only: a private chat never changes mode."""
+    m = meta or {}
+    if str(m.get("chat_type") or "") != "group":
+        return cfg
+    mode = clean_group_modes((cfg or {}).get("group_modes")).get(str(m.get("chat_id") or "").strip())
+    return dict(cfg, reply_when=mode) if mode and mode != cfg.get("reply_when") else cfg
 
 # "Bot trả lời AI" (0.64.85), khác `reply_when` (khi nào lên tiếng TRONG nhóm):
 #   "all"  - mọi cuộc chat trên kênh: chat riêng ai cũng được, mọi nhóm bot có mặt (không cần khai).
@@ -479,12 +506,18 @@ def can_xac_nhan_ngoai_le(moi: list, cu: Any, xac_nhan: Any) -> bool:
 
 
 def ngoai_le_cua(cfg: dict, meta: Optional[dict]) -> Optional[dict]:
-    """The exception that applies to this turn, or None. Private chats only, and only on the channel account the
-    exception names: both `chat_id` and `account_id` of the turn must match exactly."""
+    """The exception that applies to this turn, or None. Only on the channel account the exception names.
+
+    Private chat: `chat_id` and `account_id` of the turn must match exactly. Group (2026-11-12): the exception follows
+    the PERSON. An exception names a private chat, whose id is that person's own id on the channel, so a group turn
+    whose SENDER (`user_id`, set by the channel from the message, never from its text) is that person runs at the
+    exception's level too. Before this the owner's private chat was "full" but the same owner giving an order in a
+    group ran at the bot's own level, and sends or reminders ordered there were blocked."""
     m = meta or {}
-    if str(m.get("chat_type") or "") != "private":
+    kind = str(m.get("chat_type") or "")
+    if kind not in ("private", "group"):
         return None
-    cid = str(m.get("chat_id") or "").strip()
+    cid = str((m.get("chat_id") if kind == "private" else m.get("user_id")) or "").strip()
     aid = str(m.get("account_id") or "").strip()
     if not cid or not aid:
         return None
@@ -664,6 +697,8 @@ def _public(b: dict) -> dict:
     elif out["audience"] not in AUDIENCE:
         out["audience"] = AUDIENCE_HEP_NHAT
     out["people"] = _clean_groups(out.get("people"))
+    out["voice_reply"] = out.get("voice_reply") if out.get("voice_reply") in VOICE_REPLY else "off"
+    out["group_modes"] = clean_group_modes(out.get("group_modes"))
     # Chats the owner switched the bot off in (Chatbot v5), even though the audience would let it answer there.
     out["blocked"] = _clean_groups(out.get("blocked"))
     # Zalo labels to stay out of (0.281.0). A record from before has none: the bot answers every chat as before.
@@ -1028,6 +1063,7 @@ def create_bot(data: dict) -> tuple[Optional[str], str]:
             "bot_username": str(data.get("bot_username") or "").strip().lstrip("@"),
             "groups": _clean_groups(data.get("groups")),
             "reply_when": (data.get("reply_when") if data.get("reply_when") in REPLY_WHEN else "mention"),
+            "voice_reply": (data.get("voice_reply") if data.get("voice_reply") in VOICE_REPLY else "off"),
             "audience": (data.get("audience") if data.get("audience") in AUDIENCE else AUDIENCE_DEFAULT),
             "people": _clean_groups(data.get("people")),
             "reply_policy": __import__("chatbot_reply_policy").merge_config(None, data.get("reply_policy")),
@@ -1084,7 +1120,7 @@ def _nhan_brain_cho_tk(bot: dict) -> None:
 # thêm trường mới vào bản ghi mà quên loại khỏi danh sách đen là mở một đường ghi không ai ngờ.
 # `rate_limit` (trần câu trả lời mỗi người mỗi giờ) bị gỡ ở 0.85.4: bản ghi cũ còn khoá đó thì cứ để nguyên,
 # không ai đọc nó nữa, và patch gửi khoá đó tới thì bị bỏ qua như mọi khoá lạ.
-_PATCHABLE = ("name", "icon", "groups", "people", "audience", "reply_when", "handoff_to",
+_PATCHABLE = ("name", "icon", "groups", "people", "audience", "reply_when", "voice_reply", "group_modes", "handoff_to",
               "agent_slug", "agent_brain", "brain", "bot_username", "token", "enabled",
               "nguon_tra_loi", "muc_quyen", "ngon_ngu", "account_ids", "reply_policy", "gio_truc",
               "nhuong_tay_phut", "ngoai_le", "nhan_ket_ban", "skip_labels", "blocked",
@@ -1163,6 +1199,11 @@ def update_bot(bot_id: str, patch: dict) -> tuple[bool, str]:
                 elif k == "reply_when":
                     if v in REPLY_WHEN:
                         b["reply_when"] = v
+                elif k == "voice_reply":
+                    if v in VOICE_REPLY:
+                        b["voice_reply"] = v
+                elif k == "group_modes":
+                    b["group_modes"] = clean_group_modes(v)
                 elif k == "reply_policy":
                     # Gộp từng khoá, giá trị lạ giữ nguyên giá trị cũ (xem `merge_config`).
                     b["reply_policy"] = __import__("chatbot_reply_policy").merge_config(b.get("reply_policy"), v)

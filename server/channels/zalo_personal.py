@@ -584,6 +584,10 @@ async def send_reaction(tk: dict, chat_id: str, msg_id: str, name: str, chat_typ
     return True, ""
 
 
+GROUP_VOICE_TTL = 900       # a group voice message stays "the one they mean" this long (same as photos, ANH_CHO_GIAY)
+_GROUP_VOICE: dict = {}      # (account, group, sender) -> (voice link, time)
+
+
 async def gui_anh(tk: dict, chat_id: str, paths, chat_type: str = "private"):
     """Send images the bot asked for (0.84.3), after its text. `(ok, error)`.
 
@@ -707,9 +711,14 @@ class Transport:
             await asyncio.sleep(10)
 
     # ---- một tin khách ---------------------------------------------------------------
-    def _che_do_nhom(self) -> str:
+    def _che_do_nhom(self, thread: str = "") -> str:
+        """The bot's reply mode in a group: the group's own mode (`group_modes`) when the owner set one, else the bot's."""
         try:
-            return str((self.cfg_fn() if self.cfg_fn else {}).get("reply_when") or "")
+            import chatbot_store
+            cfg = (self.cfg_fn() if self.cfg_fn else {}) or {}
+            if thread:
+                cfg = chatbot_store.with_group_mode(cfg, {"chat_type": "group", "chat_id": thread})
+            return str(cfg.get("reply_when") or "")
         except Exception:
             return ""
 
@@ -741,6 +750,52 @@ class Transport:
                                  "account_id": self.conn_id})
         except Exception as e:      # noqa: BLE001 - nhớ ảnh hỏng không được làm sập vòng đọc tin
             print(f"[zalo-personal bot {self.conn_id}] nhớ ảnh trơn lỗi: {type(e).__name__}: {e}", file=sys.stderr)
+
+    async def _hear_group_voice(self, thread: str, url: str, conn: dict) -> tuple:
+        """(line for the model, names the bot) of an untagged group voice message; ("", False) when it cannot be heard or
+        the bot may not talk in the group. The bot is named by its connection label, learned display name or the
+        reply-policy aliases."""
+        import re
+        import chatbot_runtime
+        import zalo_audio_reply
+        import zalo_personal_channel as zc
+        cfg = (self.cfg_fn() if self.cfg_fn else {}) or {}
+        # The bot's own rule for "may I talk in this group" (audience "all" allows every group, otherwise the listed
+        # ones, and a chat the owner switched off): no speech-to-text is spent on a group the bot would not answer in.
+        if chatbot_runtime._ly_do_im_co_ban(cfg, {"chat_type": "group", "chat_id": thread, "mentioned": True}):
+            return "", False
+        line = await chatbot_runtime.nghe_cho_bot({"audio_urls": [url]}, cfg)
+        said = re.search(r'"(.+)"\)', line or "", re.S)
+        if not said:
+            return "", False
+        names = [conn.get("label") or "", (zc._ID_MINH.get(self.conn_id) or {}).get("ten") or "", "crew"]
+        names += list(((cfg.get("reply_policy") or {}).get("aliases")) or [])
+        low = " " + zalo_audio_reply._strip_accents(said.group(1)) + " "
+        named = any(len(n) >= 3 and re.search(r"(?<![a-z0-9])" + re.escape(n) + r"(?![a-z0-9])", low)
+                    for n in (zalo_audio_reply._strip_accents(x).strip() for x in names))
+        # What was said is not logged (it is a customer's speech); only whether the bot was named, so "why did it not
+        # answer my voice message" can be told from the log.
+        print(f"[zalo-personal bot {self.conn_id}] untagged group voice heard, {len(said.group(1))} chars, "
+              f"names the bot: {named}", file=sys.stderr)
+        return line.strip(), named
+
+    def _remember_group_voice(self, ev: dict, thread: str, url: str) -> None:
+        """Keep a group voice message for `GROUP_VOICE_TTL`, per (account, group, sender); the newest replaces the older."""
+        import zalo_personal_channel as zc
+        nguoi = str(ev.get("sender_id") or "")
+        minh = (zc._ID_MINH.get(self.conn_id) or {}).get("uid")
+        if not nguoi or not url or (minh and nguoi == minh):
+            return
+        now = time.time()
+        if len(_GROUP_VOICE) > 300:
+            for k in [k for k, v in _GROUP_VOICE.items() if now - v[1] > GROUP_VOICE_TTL]:
+                _GROUP_VOICE.pop(k, None)
+        _GROUP_VOICE[(self.conn_id, thread, nguoi)] = (url, now)
+
+    def _take_group_voice(self, ev: dict, thread: str) -> str:
+        """The voice link `_remember_group_voice` kept for this sender if still fresh; taken once. "" otherwise."""
+        v = _GROUP_VOICE.pop((self.conn_id, thread, str(ev.get("sender_id") or "")), None)
+        return v[0] if v and time.time() - v[1] <= GROUP_VOICE_TTL else ""
 
     async def _tai_file(self, files: list, text: str, meta: dict, thread: str, chi_file: bool) -> tuple:
         """Tải các file khách gửi về `inbox/khach` của brain bot, rồi gắn dấu file vào lượt.
@@ -849,8 +904,12 @@ class Transport:
         # 0.433.0: a video the customer sent in this private turn; the bot looks at its frames (`chatbot_runtime`).
         video_url = str(md0.get("video_url") or "") if loai == "private" and not vao_nhom else ""
         # 0.435.0: voice messages of this private turn (a merged turn carries a list, a single message its own link).
-        audio_urls = ([] if loai != "private" or vao_nhom
-                      else list(md0.get("audio_urls") or []) if md0.get("gop")
+        # Groups too (2026-11-12): the crew trains pronunciation by voice in a group ("Nhóm tiếng Tàu"); until now a group voice
+        # message was dropped, so the bot answered "em nghe chưa được". A bare group voice is remembered (`_remember_group_voice`)
+        # for the same person's next message that calls the bot; one that replies to the bot is answered at once.
+        voice_heard = False         # an untagged group voice that was heard here and names the bot (`_hear_group_voice`)
+        audio_urls = ([] if vao_nhom
+                      else list(md0.get("audio_urls") or []) if md0.get("gop") and loai == "private"
                       else [md0["audio_url"]] if kieu == "audio" and md0.get("audio_url") else [])
         if vao_nhom:
             # 0.84.2: someone joined the group. The newcomer is the "sender", so a reply tags them (`_gui`).
@@ -881,7 +940,26 @@ class Transport:
             # ở đây, nên bot không bao giờ thấy ảnh gửi trơn (15/10/2026). Đưa cho bot kèm ảnh, Agent tự quyết hỏi gì.
             if audio_urls and not co_anh and not video_url:
                 import chatbot_runtime
-                text = chatbot_runtime.AUDIO_TRON
+                if nhom:
+                    self._remember_group_voice(ev, thread, audio_urls[0])
+                    conn_g = zc.ket_noi_theo_id(self.conn_id) or {}
+                    tag_g, rep_g = zc.nhan_dien_goi(self.conn_id, ev, (conn_g.get("label") or "",))
+                    if not (tag_g or rep_g):
+                        # An untagged voice in a group: hear it, and only go on when the speaker NAMES the bot (a spoken
+                        # call, like two people talking by voice). Whether to answer is then decided like for any group
+                        # text (the reply judge in "auto"); a real tag or reply is always answered. Kept in any case for
+                        # the person's next call.
+                        heard, named = await self._hear_group_voice(thread, audio_urls[0], conn_g)
+                        if not heard:
+                            return
+                        if not named and self._che_do_nhom(thread) == "mention":
+                            return          # "mention" mode: only a spoken name calls the bot
+                        # In a group the owner set to "always" or "auto" the bot decides for itself, named or not.
+                        text = heard
+                        audio_urls = []
+                        voice_heard = True
+                if not text:
+                    text = chatbot_runtime.AUDIO_TRON
             elif video_url and not co_anh:
                 import chatbot_runtime
                 text = chatbot_runtime.VIDEO_TRON
@@ -965,6 +1043,8 @@ class Transport:
                         + " trong cuộc chat này, có thể liên quan tới tin trên]")
         if audio_urls:
             meta["audio_urls"] = audio_urls
+        if voice_heard:
+            meta["voice_heard"] = True
         if video_url:
             meta["video_url"] = video_url
             meta["video_msg"] = str(md0.get("video_msg") or ev.get("external_message_id") or "")
@@ -989,6 +1069,11 @@ class Transport:
             tag, rep = zc.nhan_dien_goi(self.conn_id, ev, (conn.get("label") or "",))
             meta["mentioned"], meta["reply_to_bot"] = tag, rep
             duoc_goi = tag or rep
+            if duoc_goi and not meta.get("audio_urls"):
+                # "@bot nhận xét giúp em" right after the person's voice message: the bot hears that voice message.
+                earlier = self._take_group_voice(ev, thread)
+                if earlier:
+                    meta["audio_urls"] = [earlier]
             if chu_nhuong and not duoc_goi:
                 return      # chủ đang nói chuyện trong nhóm và tin này không gọi ai: nhường như cũ
             if self.policy is not None:
@@ -1002,11 +1087,16 @@ class Transport:
                     pol = None
                     print(f"[zalo-personal bot {self.conn_id}] bộ phán xử lỗi: {type(e).__name__}: {e}", file=sys.stderr)
                 duoc_goi = duoc_goi or bool(meta.get("mentioned"))
+            if voice_heard and not (tag or rep):
+                # A spoken name is not a tag. In "auto" the judge decides (answer or stay silent); in the other modes
+                # a spoken name counts as a call, as a typed name does.
+                duoc_goi = self._che_do_nhom(thread) != "auto"
+                meta["mentioned"] = duoc_goi
         if nhom and not vao_nhom and not is_reaction:
             # Files in a group (0.336.0, see `zc.remember_bare_file`): a file nobody addressed to the bot waits for its
             # sender's next call; a call that quotes a file, or comes right after the sender's bare file, gets it.
             nguoi = str(ev.get("sender_id") or "")
-            if chi_file and files and not duoc_goi and self._che_do_nhom() != "always":
+            if chi_file and files and not duoc_goi and self._che_do_nhom(thread) != "always":
                 zc.remember_bare_file(self.conn_id, thread, nguoi, files[0], float(ev.get("created_at") or 0))
             elif (duoc_goi and not files and nguoi and ev.get("sender_type") == "customer" and self.precheck_fn
                   and str(ev.get("account_id") or "") == self.conn_id):
@@ -1021,9 +1111,9 @@ class Transport:
                     if cau and not nhom:
                         await self._gui(thread, cau, "private")
                     return
-            if chi_file and nhom and not duoc_goi and self._che_do_nhom() != "always":
+            if chi_file and nhom and not duoc_goi and self._che_do_nhom(thread) != "always":
                 return  # file thả vào nhóm mà không ai gọi bot: không tải, không đưa qua bộ phán xử
-            if nhom and not duoc_goi and self._che_do_nhom() == "auto":
+            if nhom and not duoc_goi and self._che_do_nhom(thread) == "auto":
                 if pol and pol.get("mode") == "on":
                     # Bộ phán xử thay cửa từ khoá: tin hiển nhiên không đáng đã được ghi vết và bỏ ở `prepare`.
                     if pol.get("action") == "drop":
@@ -1097,10 +1187,21 @@ class Transport:
                         anh = [x for x in anh if x]
                     else:
                         cau = str(out or "").strip()
-                    if (cau or anh) and zc._BOTS.get(self.conn_id) is self:
+                    # <voice>...</voice> in an answer is what to SAY; the rest is what to WRITE (the explanation of a lesson).
+                    # Without a voice reply, what was meant to be said is written instead, so nothing is lost.
+                    import zalo_audio_reply
+                    cau, spoken = zalo_audio_reply.split_voice(cau)
+                    want_voice = self._wants_voice(meta, text)
+                    if spoken and not want_voice:
+                        cau, spoken = (cau + "\n\n" + spoken).strip(), ""
+                    if (cau or anh or spoken) and zc._BOTS.get(self.conn_id) is self:
                         sent = None
                         if cau:
                             sent = await self._gui(thread, cau, loai, meta, receipt_row=receipt_row)
+                        if (cau or spoken) and want_voice:
+                            ok_voice = await self._send_voice(thread, spoken or cau, loai)
+                            if spoken and not cau:
+                                self._set_delivery(receipt_row, "accepted" if ok_voice else "failed")
                         if anh:
                             image_sent = await self._gui_anh(thread, anh, loai)
                             if not cau and image_sent:
@@ -1172,6 +1273,32 @@ class Transport:
             self.last_error = localefmt.chu(f"Gửi Zalo lỗi: {loi}", f"Zalo send failed: {loi}")[:300]
             print(f"[zalo-personal bot {self.conn_id}] {self.last_error}", file=sys.stderr)
             self._ghi_loi_gui(thread, cau, loi, chat_type)
+        return bool(ok)
+
+    def _wants_voice(self, meta: dict, hoi: str) -> bool:
+        """Should this answer also go out as a spoken mp3? Always when the customer sent a voice message (answer a voice with
+        a voice); otherwise only for a bot with `voice_reply: audio_file`: every answer in a private chat, and in a group
+        only when the asker asks to hear it (`zalo_audio_reply.asks_for_voice`), so a group is not flooded with files."""
+        import zalo_audio_reply
+        if (meta or {}).get("audio_urls") or (meta or {}).get("voice_heard"):
+            return True
+        cfg = (self.cfg_fn() if self.cfg_fn else {}) or {}
+        if cfg.get("voice_reply") != "audio_file":
+            return False
+        return (meta or {}).get("chat_type") != "group" or zalo_audio_reply.asks_for_voice(hoi)
+
+    async def _send_voice(self, thread: str, cau: str, chat_type: str = "private") -> bool:
+        """Send `cau` as a spoken mp3 after the text. A failure only shows on the bot card and its log; the text already went."""
+        import zalo_audio_reply
+        import zalo_personal_channel as zc
+        conn = zc.ket_noi_theo_id(self.conn_id) or {}
+        # Remember BEFORE sending, like images: the mp3 comes back in the read loop as the account's own file message.
+        zc.ghi_da_gui_anh(self.conn_id, thread, 1)
+        ok, loi = await zalo_audio_reply.send_audio_file(conn, thread, chat_type, cau)
+        if not ok:
+            self.last_error = localefmt.chu(f"Gửi tin thoại Zalo lỗi: {loi}", f"Zalo voice reply failed: {loi}")[:300]
+            print(f"[zalo-personal bot {self.conn_id}] {self.last_error}", file=sys.stderr)
+            self._ghi_loi_gui(thread, localefmt.chu("(tin thoại trả lời)", "(voice reply)"), loi, chat_type)
         return bool(ok)
 
     async def _gui_anh(self, thread: str, anh: list, chat_type: str = "private"):

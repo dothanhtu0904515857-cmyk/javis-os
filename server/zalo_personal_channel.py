@@ -918,7 +918,8 @@ def _ghi_lo(conn: dict, tin: list, ten: dict) -> tuple:
                 attach_echo_id(conn["id"], ev)
                 trung += 1
                 continue
-            if (ev.get("message_type") == "image" and _la_vong_anh(conn["id"], ev["external_chat_id"])) or (
+            if (ev.get("message_type") in ("image", "file")       # bot's voice reply goes out as an mp3 file
+                    and _la_vong_anh(conn["id"], ev["external_chat_id"])) or (
                     _is_link_echo(conn["id"], ev["external_chat_id"], ev, m)):
                 attach_echo_id(conn["id"], ev)
                 trung += 1
