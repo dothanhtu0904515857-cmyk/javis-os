@@ -5,7 +5,7 @@
 set -euo pipefail
 REPO="${REPO:-dothanhtu0904515857-cmyk/javis-os}"
 REF="${REF:?set REF}"
-FILES="server/channels/zalo_personal.py server/chatbot_runtime.py"
+FILES="${FILES:-server/channels/zalo_personal.py server/chatbot_runtime.py}"
 CONT="${CONT:-$(docker ps --format '{{.Names}}' | grep -E '^javis' | head -1 || true)}"
 [ -n "$CONT" ] || { echo "no javis container"; exit 1; }
 dexec() { docker exec "$@" </dev/null; }
@@ -14,7 +14,7 @@ for f in $FILES; do
   mkdir -p "$W/$(dirname "$f")" "$B/$(dirname "$f")"
   docker cp "$CONT:/app/$f" "$W/$f" >/dev/null; cp "$W/$f" "$B/$f"
 done
-curl -fsSL "https://raw.githubusercontent.com/$REPO/$REF/tools/zalo-voice-diag.patch" -o "$W/p.patch"
+curl -fsSL "https://raw.githubusercontent.com/$REPO/$REF/tools/${PATCH:-zalo-voice-diag.patch}" -o "$W/p.patch"
 cd "$W"
 if command -v git >/dev/null 2>&1; then git apply -C1 --check p.patch && git apply -C1 p.patch
 else patch -p1 --dry-run -s -i p.patch && patch -p1 -s -i p.patch; fi

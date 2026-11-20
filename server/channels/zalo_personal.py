@@ -12,6 +12,7 @@ mà tài liệu của bot trả lời được, xem `chatbot_tu_dong`. Từ 0.65
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import sys
 import time
@@ -585,6 +586,11 @@ async def send_reaction(tk: dict, chat_id: str, msg_id: str, name: str, chat_typ
 
 
 GROUP_VOICE_TTL = 900       # a group voice message stays "the one they mean" this long (same as photos, ANH_CHO_GIAY)
+# A turn holds its chat's lock. One that never ends (an engine or a voice upload that hangs) used to block that chat for
+# good: every later message, voice or tagged, was silently queued behind it until a restart. Both waits are now capped.
+TURN_TIMEOUT_S = int(os.getenv("JAVIS_ZALO_TURN_TIMEOUT", "600"))
+VOICE_SEND_TIMEOUT_S = int(os.getenv("JAVIS_ZALO_VOICE_TIMEOUT", "180"))
+TIMEOUT_MARK_VOICE = "giây (tin thoại)"
 _GROUP_VOICE: dict = {}      # (account, group, sender) -> (voice link, time)
 
 
@@ -1184,7 +1190,16 @@ class Transport:
                     meta["_on_compose"] = lambda: go.start(0)
                 try:
                     try:
-                        out = await self.answer_fn(text, meta, None)
+                        t_luot = time.time()
+                        try:
+                            out = await asyncio.wait_for(self.answer_fn(text, meta, None), TURN_TIMEOUT_S)
+                        except asyncio.TimeoutError:
+                            print(f"[zalo-personal bot {self.conn_id}] lượt quá {TURN_TIMEOUT_S}s, bỏ để không chặn "
+                                  f"cuộc chat …{thread[-6:]}", file=sys.stderr)
+                            raise
+                        if nhom:
+                            print(f"[zalo-personal bot {self.conn_id}] nhóm …{thread[-6:]}: soạn xong sau "
+                                  f"{time.time() - t_luot:.0f}s", file=sys.stderr)
                     except BaseException:
                         for f in da_tai:
                             f.unlink(missing_ok=True)
@@ -1330,12 +1345,21 @@ class Transport:
         conn = zc.ket_noi_theo_id(self.conn_id) or {}
         # Remember BEFORE sending, like images: the mp3 comes back in the read loop as the account's own file message.
         zc.ghi_da_gui_anh(self.conn_id, thread, 1)
-        ok, loi = await zalo_audio_reply.send_audio_file(conn, thread, chat_type, cau)
-        if not ok and not send_uncertain(loi):
+        async def gui_mot_lan():
+            try:
+                return await asyncio.wait_for(zalo_audio_reply.send_audio_file(conn, thread, chat_type, cau),
+                                              VOICE_SEND_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                return False, f"quá {VOICE_SEND_TIMEOUT_S} {TIMEOUT_MARK_VOICE}"
+        t0 = time.time()
+        ok, loi = await gui_mot_lan()
+        if not ok and not send_uncertain(loi) and TIMEOUT_MARK_VOICE not in str(loi):
             # One more try: the voice engine or the upload can fail once (cold model, busy server). A send that may have
             # gone out (timeout) is NOT repeated, so the group never gets the recording twice.
             zc.ghi_da_gui_anh(self.conn_id, thread, 1)
-            ok, loi = await zalo_audio_reply.send_audio_file(conn, thread, chat_type, cau)
+            ok, loi = await gui_mot_lan()
+        print(f"[zalo-personal bot {self.conn_id}] tin thoại trả lời …{thread[-6:]}: "
+              f"{'đã gửi' if ok else 'lỗi'} sau {time.time() - t0:.0f}s", file=sys.stderr)
         if not ok:
             self.last_error = localefmt.chu(f"Gửi tin thoại Zalo lỗi: {loi}", f"Zalo voice reply failed: {loi}")[:300]
             print(f"[zalo-personal bot {self.conn_id}] {self.last_error}", file=sys.stderr)

@@ -144,7 +144,10 @@ def _gtts_mp3(text: str, lang: str) -> bytes:
 
     buf = io.BytesIO()
     slow = lang.startswith("zh") and len(text) <= SLOW_ZH_CHARS
-    gTTS(text, lang=lang, slow=slow).write_to_fp(buf)
+    try:        # a Google call without a timeout can hang for ever and block the chat's turn
+        gTTS(text, lang=lang, slow=slow, timeout=30).write_to_fp(buf)
+    except TypeError:       # an old gTTS without the `timeout` argument
+        gTTS(text, lang=lang, slow=slow).write_to_fp(buf)
     return buf.getvalue()
 
 

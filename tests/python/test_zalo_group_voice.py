@@ -274,6 +274,46 @@ check("split_voice: spoken part and written part", za.split_voice("Giải thích
       == ("Giải thích: a b.", "Nǐ hǎo 你好"), za.split_voice("Giải thích: a b.\n<voice>Nǐ hǎo 你好</voice>"))
 check("split_voice: no tag means nothing split", za.split_voice("Dạ em chào anh ạ") == ("Dạ em chào anh ạ", ""))
 
+# A turn that never ends must not block the chat: the next message is answered (20/11: every later voice and tag in
+# the Tieng Tau group went unanswered until a restart).
+reset()
+CALL["tag"] = True
+calls = {"n": 0}
+
+
+async def answer_hangs_once(text, meta, _p):
+    calls["n"] += 1
+    METAS.append((text, dict(meta)))
+    if calls["n"] == 1:
+        await asyncio.sleep(3600)
+    return {"text": "Dạ em đây", "files": []}
+
+
+t_hang = zp.Transport(CID, [], answer_hangs_once, cfg_fn=lambda: dict(CFG))
+zc._BOTS[CID] = t_hang
+
+
+async def fake_send2(thread, cau, chat_type="private", meta=None, receipt_row=0):
+    TEXTS.append(cau)
+    return True
+
+
+async def fake_voice2(thread, cau, chat_type="private"):
+    SPOKEN.append((thread, cau, chat_type))
+    return True
+t_hang._gui, t_hang._send_voice = fake_send2, fake_voice2
+old_to = zp.TURN_TIMEOUT_S
+zp.TURN_TIMEOUT_S = 0.3
+
+
+async def two_turns():
+    await t_hang.xu_ly(ev("text", text="@Crew một"))
+    await t_hang.xu_ly(ev("text", text="@Crew hai"))
+asyncio.run(two_turns())
+zp.TURN_TIMEOUT_S = old_to
+check("a hung turn is cut and the next message in the same group is answered",
+      calls["n"] == 2 and (SPOKEN or TEXTS), (calls, SPOKEN, TEXTS))
+
 print()
 print("FAILED: " + ", ".join(fails) if fails else "all ok")
 sys.exit(1 if fails else 0)
