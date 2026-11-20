@@ -34,6 +34,7 @@ case "$VER" in
      fi ;;
 esac
 
+NEW_LIST="server/voice_offline.py server/zalo_audio_reply.py server/zalo_voice_reminder.py server/zalo_voice_tool.py"
 WORK="$(mktemp -d)"; BAK="/root/javis-backup-zalo-voice-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$BAK" "$WORK"
 for f in $FILES; do
@@ -42,7 +43,7 @@ for f in $FILES; do
   curl -fsSL "https://raw.githubusercontent.com/$REPO/$src" -o "$WORK/$f"
   [ -s "$WORK/$f" ] || { echo "Could not download $f"; exit 1; }
   # A file that is new in this fix is not in the container yet: nothing to back up, and undoing means deleting it.
-  docker cp "$CONT:/app/$f" "$BAK/$f" >/dev/null 2>&1 || echo "$f" >> "$BAK/NEW_FILES"
+  if echo " $NEW_LIST " | grep -q " $f "; then echo "$f" >> "$BAK/NEW_FILES"; else docker cp "$CONT:/app/$f" "$BAK/$f" >/dev/null; fi
 done
 touch "$BAK/NEW_FILES"
 echo "Backup of the current files: $BAK ($(wc -l < "$BAK/NEW_FILES") file(s) are new)"
@@ -50,14 +51,14 @@ echo "Backup of the current files: $BAK ($(wc -l < "$BAK/NEW_FILES") file(s) are
 restore() {
   echo "Putting the old files back..."
   for f in $FILES; do
-    if grep -qx "$f" "$BAK/NEW_FILES"; then docker exec "$CONT" rm -f "/app/$f"; else docker cp "$BAK/$f" "$CONT:/app/$f"; fi
+    if grep -qx "$f" "$BAK/NEW_FILES"; then docker exec -u root "$CONT" rm -f "/app/$f" || true; else docker cp "$BAK/$f" "$CONT:/app/$f" || true; fi
   done
   docker restart "$CONT" >/dev/null
 }
 
 for f in $FILES; do docker cp "$WORK/$f" "$CONT:/app/$f"; done
 for f in $FILES; do
-  case "$f" in *.py) docker exec "$CONT" python -m py_compile "/app/$f" || { echo "Syntax check failed: $f"; restore; exit 1; };; esac
+  case "$f" in *.py) docker exec "$CONT" python -c "import ast,sys; ast.parse(open(sys.argv[1],encoding='utf-8').read())" "/app/$f" || { echo "Syntax check failed: $f"; restore; exit 1; };; esac
 done
 
 # The old host guard re-applies OLDER Zalo patches after updates; these files already include them.
@@ -68,7 +69,7 @@ if crontab -l 2>/dev/null | grep -q javis-reapply; then
 fi
 
 # The voice to clone: the reference recording from the Marketing brain, copied next to the voice engine.
-docker exec "$CONT" sh -c '
+docker exec -u root "$CONT" sh -c '
   d=/data/state/tts; mkdir -p "$d"
   if [ -s "$d/ref_giong.wav" ]; then echo "Reference voice already set: $d/ref_giong.wav"; exit 0; fi
   f=$(find /data -name ref_giong_sach.wav -not -path "*/state/tts/*" 2>/dev/null | head -1)
