@@ -6,6 +6,24 @@ Lịch sử phiên bản Javis OS. Bản mới nhất ở trên cùng. Xem ngay 
 
 Định dạng: mỗi phiên bản là một khối `## [x.y.z] - ngày`, bên dưới nhóm thay đổi theo `### Thêm mới / Sửa lỗi / Cải thiện / Bảo mật`.
 
+## [0.607.2] - 2026-11-20
+### Sửa lỗi
+- **Chấm đỏ ở thư mục hội thoại chỉ hiện khi chat đã xong mà chưa đọc.** Chat còn đang chạy hiện vòng xoay chứ không làm sáng chấm đỏ ở thư mục, ở dòng "Chưa xếp nhóm", ở chính dòng chat và ở menu bên trái. Chat đang mở trên màn hình cũng không bị tính. Lượt chạy xong mà chưa được xem thì chấm đỏ mới hiện.
+
+## [0.607.1] - 2026-11-20
+### Sửa lỗi
+- **Bot Zalo cá nhân đọc được tin dạng thẻ link.** Trước đây một link người khác gửi (Zalo hiện thành thẻ có tiêu đề và ảnh) bị xếp vào loại "khác" nên bot bỏ qua, kể cả khi người gửi tag bot. Giờ thẻ link được đọc như tin chữ, gồm tiêu đề, mô tả và địa chỉ link.
+- **Hộp thư và lịch sử giữ lại địa chỉ link.** Tin thẻ link không còn chỉ hiện dòng mô tả của trang mà có cả link để bấm, kể cả tin nhập lại từ lịch sử (javis-zalo 1.14.0).
+
+## [0.607.0] - 2026-11-20
+### Cải thiện
+- **"Chưa xếp nhóm" cũng có chấm đỏ.** Cuộc chat chưa thuộc dự án nào mà có câu trả lời chưa đọc thì mục Chưa xếp nhóm trong ô chọn dự án hiện chấm đỏ, giống các dự án. Đọc xong hoặc xếp cuộc đó vào một dự án thì chấm tự tắt.
+
+## [0.606.1] - 2026-11-20
+### Sửa lỗi
+- **Kết nối nick Zalo thứ hai không còn làm nick thứ nhất mất kết nối.** Hai người báo ngày 19 và 20/11/2026: mỗi nick một bot ở hai brain, vừa quét QR nick thứ hai thì thẻ bot của nick thứ nhất báo "Một phiên khác của cùng nick đang giành kết nối Zalo" và bot lỡ phần lớn tin, dù không ai mở Zalo Web.
+- **Quét QR bằng nick đã kết nối thì Javis báo ngay, không tạo kết nối thứ hai.** Câu báo nêu tên kết nối đang giữ nick đó. Muốn nối nick khác, mở app Zalo bằng nick đó rồi quét lại.
+
 ## [0.606.0] - 2026-11-20
 ### Cải thiện
 - **Javis tìm đúng tool hơn hẳn khi có nhiều nguồn.** Câu hỏi đời thường như "doanh thu hôm nay trên POS", "lịch sử tin nhắn Zalo", "chi phí Google Ads" giờ ra đúng tool, kể cả khi mô tả tool viết tiếng Anh. Trên bộ 55 câu thử thật, tỉ lệ tìm trúng từ 20 lên 55.

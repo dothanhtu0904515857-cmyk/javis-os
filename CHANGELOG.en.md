@@ -8,6 +8,24 @@ English entries start at 0.66.0. Every earlier release is described in the Vietn
 
 Format: each release is a `## [x.y.z] - date` block, with changes grouped under `### Added / Fixed / Improved / Security`.
 
+## [0.607.2] - 2026-11-20
+### Fixed
+- **The chat folder's red dot shows only for a chat that has finished and is unread.** A chat still working shows its spinner and no longer lights the folder, the "Ungrouped" row, its own row or the side menu. The chat open on screen is not counted either. The dot appears once a run ends and you have not looked at it.
+
+## [0.607.1] - 2026-11-20
+### Fixed
+- **The personal Zalo bot reads link cards.** A link someone sent (shown by Zalo as a card with a title and a picture) was filed as "other", so the bot skipped it, even when the sender tagged the bot. A link card is now read as a text message with its title, description and link.
+- **The inbox and the history keep the link.** A link card no longer shows only the page's description: the link itself is there too, also for messages brought back from the history (javis-zalo 1.14.0).
+
+## [0.607.0] - 2026-11-20
+### Improved
+- **"Ungrouped" gets a red dot too.** A chat in no project with an unread reply now puts a red dot on Ungrouped in the project picker, just like a project. Reading it or moving it into a project clears the dot.
+
+## [0.606.1] - 2026-11-20
+### Fixed
+- **Connecting a second Zalo account no longer cuts the first one off.** Two reports on 19 and 20/11/2026: one bot per account in two brains, and right after the second account's QR was scanned the first bot's card read "Another session of this account keeps taking the Zalo connection" and the bot missed most messages, with no Zalo Web open anywhere.
+- **Scanning the QR with an account that is already connected is refused right away**, instead of adding a second connection. The message names the connection that holds that account. To connect another account, open the Zalo app signed in as it and scan again.
+
 ## [0.606.0] - 2026-11-20
 ### Improved
 - **Javis finds the right tool far more often when many sources are connected.** Everyday requests such as "today's POS revenue", "Zalo message history" or "Google Ads cost" now reach the right tool, even when tool descriptions are in English. On 55 real test requests, hits rose from 20 to 55.
