@@ -1475,6 +1475,11 @@ def _make_precheck_fn(bot_id: str):
         if (meta or {}).get("member_join"):
             # A join in a group the bot may not speak in: silent, and not a "call" for the approval queue.
             return {}
+        if ly_do != "khong_goi_ten":
+            # Silence the owner may need to explain ("why did the bot not answer"): the code is logged, never the
+            # message. "khong_goi_ten" is normal group chatter and would flood the log.
+            print(f"[chatbot {bot_id}] im lặng ở {(meta or {}).get('chat_type') or 'private'} "
+                  f"…{str((meta or {}).get('chat_id') or '')[-6:]}: {ly_do}", file=sys.stderr)
         if ly_do in ("ngoai_gio_truc", "chat_tat"):
             # Outside active hours, or the owner switched the bot off in this chat (Chatbot v5): silent, nothing sent. A message the bot WOULD have answered still goes to the
             # inbox so whoever is on duty reads it in the morning; group chatter in "Tự đánh giá" mode does not,
