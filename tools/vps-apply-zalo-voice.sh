@@ -41,11 +41,19 @@ for f in $FILES; do
   if [ "$f" = "server/main.py" ]; then src="$MAIN_URL_REF/$MAIN_URL_PATH"; else src="$REF/$f"; fi
   curl -fsSL "https://raw.githubusercontent.com/$REPO/$src" -o "$WORK/$f"
   [ -s "$WORK/$f" ] || { echo "Could not download $f"; exit 1; }
-  docker cp "$CONT:/app/$f" "$BAK/$f"
+  # A file that is new in this fix is not in the container yet: nothing to back up, and undoing means deleting it.
+  docker cp "$CONT:/app/$f" "$BAK/$f" >/dev/null 2>&1 || echo "$f" >> "$BAK/NEW_FILES"
 done
-echo "Backup of the current files: $BAK"
+touch "$BAK/NEW_FILES"
+echo "Backup of the current files: $BAK ($(wc -l < "$BAK/NEW_FILES") file(s) are new)"
 
-restore() { echo "Putting the old files back..."; for f in $FILES; do docker cp "$BAK/$f" "$CONT:/app/$f"; done; docker restart "$CONT" >/dev/null; }
+restore() {
+  echo "Putting the old files back..."
+  for f in $FILES; do
+    if grep -qx "$f" "$BAK/NEW_FILES"; then docker exec "$CONT" rm -f "/app/$f"; else docker cp "$BAK/$f" "$CONT:/app/$f"; fi
+  done
+  docker restart "$CONT" >/dev/null
+}
 
 for f in $FILES; do docker cp "$WORK/$f" "$CONT:/app/$f"; done
 for f in $FILES; do
@@ -73,7 +81,7 @@ echo -n "Waiting for Javis"
 for i in $(seq 1 40); do
   if docker exec "$CONT" python -c "import urllib.request,os,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:'+os.getenv('JAVIS_PORT','7777')+'/health',timeout=4).status==200 else 1)" 2>/dev/null; then
     echo " ... up."; echo "Done. Send a voice message to the bot in a Zalo group (reply to it or tag it)."
-    echo "To undo: for each file in $BAK run  docker cp <file> $CONT:/app/<file>  then  docker restart $CONT"
+    echo "To undo: copy the files in $BAK back with docker cp (the ones listed in $BAK/NEW_FILES are simply deleted), then docker restart $CONT"
     exit 0
   fi
   echo -n "."; sleep 3
