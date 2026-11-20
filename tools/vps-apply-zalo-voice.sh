@@ -8,6 +8,8 @@
 # syntax-checks the new files and puts the backup back if anything fails. A container that is recreated (an update)
 # loses these files; the fix is permanent once the pull request is in a release.
 set -euo pipefail
+# docker exec must never read the script itself when it arrives through a pipe (curl | bash).
+dexec() { docker exec "$@" </dev/null; }
 
 REPO="${REPO:-dothanhtu0904515857-cmyk/javis-os}"
 REF="${REF:-claude/command-no-response-2c76eb}"
@@ -19,7 +21,7 @@ system/plugins/javis-schedule/plugin.py"
 
 CONT="${CONT:-$(docker ps --format '{{.Names}}' | grep -E '^javis' | head -1 || true)}"
 [ -n "$CONT" ] || { echo "No running container whose name starts with 'javis'. Set CONT=<name>."; exit 1; }
-VER="$(docker exec "$CONT" cat /app/VERSION | tr -d '[:space:]')"
+VER="$(dexec "$CONT" cat /app/VERSION | tr -d '[:space:]')"
 echo "Container: $CONT, Javis version: $VER"
 # Only server/main.py differs between 0.603.0 and 0.606.0 among these files; 0.603.0 gets its own main.py (the 0.603.0
 # one plus the same changes), kept on the branch `vps-compat-0.603.0`.
@@ -51,14 +53,14 @@ echo "Backup of the current files: $BAK ($(wc -l < "$BAK/NEW_FILES") file(s) are
 restore() {
   echo "Putting the old files back..."
   for f in $FILES; do
-    if grep -qx "$f" "$BAK/NEW_FILES"; then docker exec -u root "$CONT" rm -f "/app/$f" || true; else docker cp "$BAK/$f" "$CONT:/app/$f" || true; fi
+    if grep -qx "$f" "$BAK/NEW_FILES"; then dexec -u root "$CONT" rm -f "/app/$f" || true; else docker cp "$BAK/$f" "$CONT:/app/$f" || true; fi
   done
   docker restart "$CONT" >/dev/null
 }
 
 for f in $FILES; do docker cp "$WORK/$f" "$CONT:/app/$f"; done
 for f in $FILES; do
-  case "$f" in *.py) docker exec "$CONT" python -c "import ast,sys; ast.parse(open(sys.argv[1],encoding='utf-8').read())" "/app/$f" || { echo "Syntax check failed: $f"; restore; exit 1; };; esac
+  case "$f" in *.py) dexec "$CONT" python -c "import ast,sys; ast.parse(open(sys.argv[1],encoding='utf-8').read())" "/app/$f" || { echo "Syntax check failed: $f"; restore; exit 1; };; esac
 done
 
 # The old host guard re-applies OLDER Zalo patches after updates; these files already include them.
@@ -69,7 +71,7 @@ if crontab -l 2>/dev/null | grep -q javis-reapply; then
 fi
 
 # The voice to clone: the reference recording from the Marketing brain, copied next to the voice engine.
-docker exec -u root "$CONT" sh -c '
+dexec -u root "$CONT" sh -c '
   d=/data/state/tts; mkdir -p "$d"
   if [ -s "$d/ref_giong.wav" ]; then echo "Reference voice already set: $d/ref_giong.wav"; exit 0; fi
   f=$(find /data -name ref_giong_sach.wav -not -path "*/state/tts/*" 2>/dev/null | head -1)
@@ -80,7 +82,7 @@ docker exec -u root "$CONT" sh -c '
 docker restart "$CONT" >/dev/null
 echo -n "Waiting for Javis"
 for i in $(seq 1 40); do
-  if docker exec "$CONT" python -c "import urllib.request,os,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:'+os.getenv('JAVIS_PORT','7777')+'/health',timeout=4).status==200 else 1)" 2>/dev/null; then
+  if dexec "$CONT" python -c "import urllib.request,os,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:'+os.getenv('JAVIS_PORT','7777')+'/health',timeout=4).status==200 else 1)" 2>/dev/null; then
     echo " ... up."; echo "Done. Send a voice message to the bot in a Zalo group (reply to it or tag it)."
     echo "To undo: copy the files in $BAK back with docker cp (the ones listed in $BAK/NEW_FILES are simply deleted), then docker restart $CONT"
     exit 0
