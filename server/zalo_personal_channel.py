@@ -1066,6 +1066,11 @@ async def _vong() -> None:
             print(f"[zalo-personal] added zalo_send_voice to {f}", file=sys.stderr)
     except Exception:       # noqa: BLE001
         pass
+    try:        # load the VieNeu voice model now, so the first voice reply does not wait for it
+        import voice_offline
+        voice_offline.warm_soon()
+    except Exception:       # noqa: BLE001
+        pass
     while not _stop:
         if _WAKE is not None:
             _WAKE.clear()       # before the pass: whatever calls wake() from here on is seen by the next sleep

@@ -144,11 +144,158 @@ def say_words(text: str) -> str:
     return t
 
 
+# ---- Warm VieNeu: the model is loaded ONCE and kept in a worker process ---------------------------------------------
+# Starting VieNeu for every sentence spent most of the time loading the model (about 33 s for one short sentence on the
+# VPS). The worker loads it once and then reads one request per line: {"text", "voice", "out"} -> {"ok"} | {"error"}.
+# Protocol lines carry `_MARK` on a private copy of stdout; everything the library prints goes to stderr (a log file),
+# so a progress bar can never break the protocol. Pure code: no AI tokens are spent on speech.
+_MARK = "@@JAVIS_TTS@@"
+_WORKER_SCRIPT = (
+    "import os, sys, json\n"
+    "proto = os.fdopen(os.dup(1), 'w', encoding='utf-8')\n"
+    "os.dup2(2, 1)\n"
+    "ref = sys.argv[1]\n"
+    "from vieneu import Vieneu\n"
+    "v = Vieneu(mode='v3turbo') if ref else Vieneu(precision='int8')\n"
+    "def say(d):\n"
+    f"    proto.write({_MARK!r} + json.dumps(d) + '\\n'); proto.flush()\n"
+    "say({'ready': True})\n"
+    "for line in sys.stdin:\n"
+    "    try:\n"
+    "        r = json.loads(line)\n"
+    "        a = v.infer(r['text'], ref_audio=ref) if ref else v.infer(r['text'], voice=r.get('voice'))\n"
+    "        v.save(a, r['out'])\n"
+    "        say({'ok': True})\n"
+    "    except Exception as e:\n"
+    "        say({'ok': False, 'error': type(e).__name__ + ': ' + str(e)[:200]})\n")
+WORKER_START_S = 240        # loading the model (first start on a 2-CPU VPS)
+WORKER_REQUEST_S = 150      # one sentence
+_W: Dict[str, object] = {"proc": None, "ref": None, "lock": None, "log": None}
+
+
+async def _worker_read(proc, timeout: float) -> dict:
+    import json
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        left = deadline - asyncio.get_running_loop().time()
+        if left <= 0:
+            raise TimeoutError("VieNeu worker did not answer in time")
+        line = await asyncio.wait_for(proc.stdout.readline(), left)
+        if not line:
+            raise RuntimeError("VieNeu worker exited")
+        s = line.decode("utf-8", "replace").strip()
+        if s.startswith(_MARK):
+            return json.loads(s[len(_MARK):])
+
+
+def _worker_stop() -> None:
+    p = _W.get("proc")
+    _W["proc"] = None
+    if p is not None and p.returncode is None:
+        try:
+            p.kill()
+        except ProcessLookupError:
+            pass
+
+
+async def _worker() -> Optional[object]:
+    """The running worker for the current reference voice, started (and the model loaded) if needed. None on failure."""
+    ref = clone_ref()
+    key = str(ref) if ref else ""
+    p = _W.get("proc")
+    if p is not None and p.returncode is None and _W.get("ref") == key:
+        return p
+    _worker_stop()
+    h = home()
+    env = dict(os.environ, PYTHONPATH=str(h / "vieneu-lib"), HF_HOME=str(_hf_dir()), HF_HUB_OFFLINE="1",
+               PYTHONUNBUFFERED="1")
+    log = None
+    try:
+        log = open(h / "worker.log", "ab")
+    except OSError:
+        pass
+    t0 = asyncio.get_running_loop().time()
+    try:
+        p = await asyncio.create_subprocess_exec(sys.executable, "-c", _WORKER_SCRIPT, key, env=env,
+                                                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                                                 stderr=log or asyncio.subprocess.DEVNULL)
+        _W.update(proc=p, ref=key)
+        first = await _worker_read(p, WORKER_START_S)
+        if not first.get("ready"):
+            raise RuntimeError(f"unexpected first line {first}")
+    except Exception as e:      # noqa: BLE001
+        print(f"[voice offline] VieNeu worker did not start: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        _worker_stop()
+        return None
+    finally:
+        if log is not None:
+            log.close()         # the child keeps its own copy of the file
+    print(f"[voice offline] VieNeu worker ready in {asyncio.get_running_loop().time() - t0:.1f}s "
+          f"({'cloned voice' if key else 'preset voice'})", file=sys.stderr, flush=True)
+    return p
+
+
+async def _speak_warm(text: str) -> bytes:
+    """One sentence through the warm worker: mp3 bytes, or b"" (the worker is then restarted on the next call)."""
+    import json
+    import tempfile
+    if _W.get("lock") is None:
+        _W["lock"] = asyncio.Lock()
+    async with _W["lock"]:      # one sentence at a time: the model is not shared between requests
+        p = await _worker()
+        if p is None:
+            return b""
+        out = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        out.close()
+        try:
+            p.stdin.write((json.dumps({"text": say_words(text), "voice": VIENEU_VOICE, "out": out.name},
+                                      ensure_ascii=False) + "\n").encode("utf-8"))
+            await p.stdin.drain()
+            r = await _worker_read(p, WORKER_REQUEST_S)
+            if not r.get("ok"):
+                print(f"[voice offline] VieNeu worker: {r.get('error')}", file=sys.stderr, flush=True)
+                return b""
+            wav = Path(out.name).read_bytes()
+            return await asyncio.to_thread(_to_mp3, wav) if wav else b""
+        except Exception as e:      # noqa: BLE001 - a stuck or dead worker is replaced on the next sentence
+            print(f"[voice offline] VieNeu worker failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            _worker_stop()
+            return b""
+        finally:
+            try:
+                os.unlink(out.name)
+            except OSError:
+                pass
+
+
+def warm_soon() -> None:
+    """Start the worker in the background (model loaded before the first voice message arrives). Never raises; does
+    nothing when VieNeu is not installed or `JAVIS_VIENEU_WARM=0`."""
+    if os.getenv("JAVIS_VIENEU_WARM", "1") == "0" or not vieneu_available():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    async def go():
+        if _W.get("lock") is None:
+            _W["lock"] = asyncio.Lock()
+        async with _W["lock"]:
+            await _worker()
+    loop.create_task(go())
+
+
 async def speak_vi_clone(text: str) -> bytes:
     """Vietnamese read by VieNeu (the cloned voice when a reference recording is set up). mp3 bytes, or b"" when VieNeu
-    is not installed or fails; never raises and never falls back to another engine, so the caller picks the fallback."""
+    is not installed or fails; never raises and never falls back to another engine, so the caller picks the fallback.
+    The warm worker answers first; a one-shot process (slow: loads the model) is the backup when the worker is off."""
     if not vieneu_available() or not str(text or "").strip():
         return b""
+    if os.getenv("JAVIS_VIENEU_WARM", "1") != "0":
+        b = await _speak_warm(text)
+        if b:
+            return b
     try:
         return await asyncio.to_thread(_vieneu_sync, text)
     except Exception as e:      # noqa: BLE001
