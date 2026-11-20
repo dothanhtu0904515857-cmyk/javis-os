@@ -91,13 +91,69 @@ def _speak_sync(text: str, lang: str) -> bytes:
 
 
 VIENEU_VOICE = "Trúc Ly"      # female, northern, natural (preset of VieNeu-TTS v3 Turbo, Apache-2.0)
-_VIENEU_SCRIPT = ("import sys\nfrom vieneu import Vieneu\nv = Vieneu(precision='int8')\n"
-                  "v.save(v.infer(sys.argv[1], voice=sys.argv[2]), sys.argv[3])\n")
+# argv: text, preset voice, out.wav, reference wav ("" = no clone). With a reference recording the model clones that
+# voice (the owner's "Giọng sách"): no AI tokens, a few seconds per sentence on the VPS. `pronounce.json` in the tts
+# folder (optional) rewrites words before they are read, like the daily-video skill does.
+_VIENEU_SCRIPT = ("import sys\nfrom vieneu import Vieneu\n"
+                  "text, voice, out, ref = sys.argv[1:5]\n"
+                  "if ref:\n"
+                  "    v = Vieneu(mode='v3turbo')\n"
+                  "    v.save(v.infer(text, ref_audio=ref), out)\n"
+                  "else:\n"
+                  "    v = Vieneu(precision='int8')\n"
+                  "    v.save(v.infer(text, voice=voice), out)\n")
+# How the company name is said (owner, 2026-11-18): the letters CREWVN read as one word come out wrong.
+_SAY = ((re.compile(r"\bcrewvn\b", re.I), "cờ riu vi en"),)
+
+
+def clone_ref() -> Optional[Path]:
+    """The recording of the voice to clone, or None (then the preset voice speaks). `JAVIS_VOICE_CLONE_REF` names it;
+    otherwise `<state>/tts/ref_giong.wav`. Put the owner's reference file there with
+    `python server/voice_offline.py clone <file.wav>`."""
+    for c in (os.getenv("JAVIS_VOICE_CLONE_REF", "").strip(), str(home() / "ref_giong.wav")):
+        if c and Path(c).is_file() and Path(c).stat().st_size > 2000:
+            return Path(c)
+    return None
+
+
+def _hf_dir() -> Path:
+    """Weights folder: `hf-w` (the clone model, v3 turbo) when it exists, else `hf`."""
+    h = home()
+    return h / "hf-w" if (h / "hf-w").is_dir() else h / "hf"
 
 
 def vieneu_available() -> bool:
     h = home()
-    return (h / "vieneu-lib" / "vieneu").is_dir() and (h / "hf").is_dir()
+    return (h / "vieneu-lib" / "vieneu").is_dir() and _hf_dir().is_dir()
+
+
+def say_words(text: str) -> str:
+    """The text as it must be pronounced: the company name spelled out, plus the optional `pronounce.json` dictionary
+    (`{"từ": "cách đọc"}`) in the tts folder."""
+    t = str(text or "")
+    for rx, rep in _SAY:
+        t = rx.sub(rep, t)
+    try:
+        import json
+        d = json.loads((home() / "pronounce.json").read_text(encoding="utf-8"))
+        for k, v in sorted(d.items(), key=lambda kv: -len(kv[0])):
+            if k:
+                t = re.sub(re.escape(str(k)), str(v), t, flags=re.I)
+    except (OSError, ValueError, AttributeError):
+        pass
+    return t
+
+
+async def speak_vi_clone(text: str) -> bytes:
+    """Vietnamese read by VieNeu (the cloned voice when a reference recording is set up). mp3 bytes, or b"" when VieNeu
+    is not installed or fails; never raises and never falls back to another engine, so the caller picks the fallback."""
+    if not vieneu_available() or not str(text or "").strip():
+        return b""
+    try:
+        return await asyncio.to_thread(_vieneu_sync, text)
+    except Exception as e:      # noqa: BLE001
+        print(f"[voice offline] VieNeu failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        return b""
 
 
 def _to_mp3(wav: bytes) -> bytes:
@@ -111,12 +167,13 @@ def _vieneu_sync(text: str) -> bytes:
     stay in `<state>/tts/vieneu-lib` and never meet the server's. Weights are in `<state>/tts/hf`, read offline."""
     import tempfile
     h = home()
-    env = dict(os.environ, PYTHONPATH=str(h / "vieneu-lib"), HF_HOME=str(h / "hf"), HF_HUB_OFFLINE="1")
+    env = dict(os.environ, PYTHONPATH=str(h / "vieneu-lib"), HF_HOME=str(_hf_dir()), HF_HUB_OFFLINE="1")
     out = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     out.close()
+    ref = clone_ref()
     try:
-        r = subprocess.run([sys.executable, "-c", _VIENEU_SCRIPT, text, VIENEU_VOICE, out.name], env=env,
-                           capture_output=True, text=True, timeout=180)
+        r = subprocess.run([sys.executable, "-c", _VIENEU_SCRIPT, say_words(text), VIENEU_VOICE, out.name,
+                            str(ref) if ref else ""], env=env, capture_output=True, text=True, timeout=180)
         wav = Path(out.name).read_bytes()
         if r.returncode != 0 or not wav:
             print(f"[voice offline] VieNeu gave no audio (exit {r.returncode}): {(r.stderr or '').strip()[-200:]}",
@@ -228,5 +285,19 @@ def install(target: Optional[Path] = None) -> None:
             print(dst, dst.stat().st_size)
 
 
+def set_clone_ref(src: str) -> Path:
+    """Copy the reference recording of the voice to clone into `<state>/tts/ref_giong.wav`."""
+    import shutil
+    s = Path(src)
+    if not s.is_file() or s.stat().st_size <= 2000:
+        raise FileNotFoundError(f"reference recording not found or empty: {src}")
+    dst = home() / "ref_giong.wav"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(s, dst)
+    return dst
+
+
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "install":
     install()
+elif __name__ == "__main__" and len(sys.argv) > 2 and sys.argv[1] == "clone":
+    print(set_clone_ref(sys.argv[2]))

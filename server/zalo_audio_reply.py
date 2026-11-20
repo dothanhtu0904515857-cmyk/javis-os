@@ -159,12 +159,31 @@ async def make_mp3(text: str) -> bytes:
     if not clean:
         raise ValueError("empty voice reply")
     parts = _segments(clean)
+    # Vietnamese pieces are read by VieNeu (the owner's cloned voice when its reference recording is set up, see
+    # `voice_offline.clone_ref`): no tokens, no internet. English and Chinese pieces keep their own voices. Anything
+    # VieNeu cannot do falls through to the online voices below.
     audio = bytearray()
     try:
+        import voice_offline
+        pieces, used_clone = [], False
         for part, lang in parts:
-            audio.extend(await asyncio.to_thread(_gtts_mp3, part, lang))
+            b = await voice_offline.speak_vi_clone(part) if lang == "vi" else b""
+            used_clone = used_clone or bool(b)
+            pieces.append(b or await asyncio.to_thread(_gtts_mp3, part, lang))
+        if used_clone:
+            # Pieces come from engines with different sample rates: join them properly, not byte by byte.
+            joined = await asyncio.to_thread(voice_offline._concat, pieces) if len(pieces) > 1 else pieces[0]
+            audio.extend(joined or b"".join(pieces))
+        else:
+            audio.extend(b"".join(pieces))
     except Exception:
         audio = bytearray()
+    if not audio:
+        try:
+            for part, lang in parts:
+                audio.extend(await asyncio.to_thread(_gtts_mp3, part, lang))
+        except Exception:
+            audio = bytearray()
     if not audio:
         for part, lang in parts:
             voice, rate = _EDGE_VOICES[lang]
