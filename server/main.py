@@ -15803,6 +15803,63 @@ async def _zalo_send_file_to(chat_id, path) -> tuple:
     return await bot.send_file(path, chat=cid)
 
 
+async def _zalo_voice_deliver(rem, text, brain) -> tuple:
+    """A reminder with a Zalo target (2026-11-16): the owner is tagged, "rung" and sent the note as a voice message.
+    The connection is the one the reminder names, else the only enabled personal Zalo account."""
+    import zalo_cli
+    import zalo_personal_channel as zc
+    import zalo_voice_reminder as zvr
+    from channels import zalo_personal as zp
+    tg = zvr.clean_target(rem.get("zalo"))
+    if not tg:
+        return False, "no Zalo thread"
+    conns = zc._ket_noi()
+    want = tg["conn"].strip().lower()
+    # The account is named by id or by the name on the Connections page ("Crewvn").
+    conn = (next((c for c in conns if c.get("id") == tg["conn"] or str(c.get("label") or "").strip().lower() == want), None)
+            if want else (conns[0] if len(conns) == 1 else None))
+    if not conn:
+        return False, localefmt.chu("không rõ nick Zalo nào để gửi (kết nối đã tắt hoặc có nhiều nick)",
+                                    "no single Zalo account to send from (connection off, or several accounts)")
+    root = _brain_root(brain)
+    chat_type = "group" if tg["type"] == 1 else "private"
+
+    async def send_text(line, mention=None):
+        return await zp.gui({"id": conn["id"]}, tg["thread"], line, chat_type, mention)
+
+    async def make_voice(line):
+        import voice_offline      # Piper voices kept on the machine, so the reminder is spoken with or without internet
+        res = await voice_note.make(root, line, synth=voice_offline.offline_first(voice_note._chosen_synth()))
+        if not res.get("ok"):
+            raise RuntimeError(str(res.get("error") or "voice engine failed"))
+        return str(Path(root) / res["rel_path"])
+
+    async def send_voice(path):
+        home = zalo_cli.home_of(conn)
+        # A real voice bubble first; an older javis-zalo (no such tool) or a refused link falls back to a file.
+        ok, _d, err = await zalo_cli.send_voice(conn["id"], home, tg["thread"], Path(path), tg["type"])
+        if ok:
+            return True, ""
+        print(f"[zalo voice] bubble failed, sending the mp3 as a file: {err}", flush=True)
+        if "zalo_send_voice" in str(err):     # an update wiped the tool: put it back for the next connection start
+            import zalo_voice_tool
+            zalo_voice_tool.ensure(cfgmod.STATE_DIR)
+        ok, _d, err2 = await zalo_cli.send_files(conn["id"], home, tg["thread"], [Path(path)], tg["type"])
+        return ok, ("" if ok else err2) or ""
+
+    async def send_reminder(title):
+        # The reminder entry inside the Zalo chat (`javis-zalo reminder create`), set for now: Zalo notifies at once.
+        home = zalo_cli.home_of(conn)
+        if not home:
+            return False, "no session folder"
+        ok, _d, err = await zalo_cli.run_cli({"home": home}, ["reminder", "create"], [tg["thread"], title],
+                                             ["-t", str(tg["type"])])
+        return ok, str(err or "")
+
+    return await zvr.deliver(tg, text, send_text=send_text, send_voice=send_voice, make_voice=make_voice, root=root,
+                             send_reminder=send_reminder)
+
+
 import my_tasks as my_tasks_mod
 import gcal_read
 
@@ -15896,6 +15953,7 @@ reminders_feature = reminders_mod.register(app, reminders_mod.RemindersDeps(
     send_file=lambda chat_id, path, brain: _send_voice_file(chat_id, path, brain),
     build_agent_prompt=_background_agent_prompt,          # made in a partner chat -> runs as that assistant
     finish_agent_run=_finish_background_agent_run,
+    zalo_deliver=_zalo_voice_deliver,
 ))
 
 
