@@ -28,6 +28,7 @@ Xem docs/dev/2026-08-bot-chuyen-trach-spec.md.
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import secrets
 import sys
@@ -771,6 +772,91 @@ _NGU_CANH_NHOM = (
     "Chỉ trả lời tin đang hỏi.\n<chat_data>\n{khoi}\n</chat_data>")
 
 
+GROUP_VOICE_MAX = 3          # voice messages heard per turn for the group context (newest first): each is a speech-to-text call
+GROUP_VOICE_SECONDS = 150    # total time one turn may spend downloading and hearing them
+
+
+def _voice_url_of(row: dict) -> str:
+    """The audio link of a stored message row, or "" when the row is not a voice message with an https link."""
+    if str(row.get("message_type") or "") != "audio":
+        return ""
+    try:
+        md = json.loads(row.get("metadata_json") or "{}")
+    except (TypeError, ValueError):
+        md = {}
+    url = str((md or {}).get("audio_url") or "")
+    return url if url.startswith("https://") else ""
+
+
+def _voice_line(row: dict, voices: dict) -> str:
+    """The group-context text of a voice message row: what it said when heard, else a plain marker. "" for other rows."""
+    if str(row.get("message_type") or "") != "audio":
+        return ""
+    said = str((voices or {}).get(_voice_url_of(row)) or "").strip().replace("<", "(").replace(">", ")")
+    if said:
+        return f'[voice message, machine transcript, may be wrong: "{said}"]'
+    return "[voice message that could not be heard]"
+
+
+async def hear_group_voices(meta: dict, kenh: str, tai_khoan: str, cfg: dict) -> dict:
+    """{url: transcript} for the newest voice messages in the group context of this turn (2026-11-25).
+
+    Field report 2026-11-25: a teacher sent two voice messages in a group without tagging the bot, then the owner tagged
+    it with typed words. Only a tagged message is heard (`nghe_cho_bot`), and the group context carried text only, so the
+    bot said it could not hear them. Now the newest `GROUP_VOICE_MAX` voice messages before the asking one are heard here
+    (transcripts cached per link in `zalo_voice_history`, so each message is heard once) and `ngu_canh_nhom` shows what
+    they said. Voice messages the turn itself carries (`meta["audio_urls"]`) are skipped: `nghe_cho_bot` hears those.
+    Never raises; a message that cannot be heard simply stays unheard."""
+    m = meta or {}
+    if m.get("chat_type") != "group" or not m.get("chat_id"):
+        return {}
+    try:
+        import zalo_attachments
+        import zalo_voice_history
+        rows = conversations.tin_gan_day(kenh, tai_khoan, m["chat_id"], NGU_CANH_TIN + 1)
+        mid = str(m.get("message_id") or "")
+        own = set(str(u) for u in (m.get("audio_urls") or []))
+        urls = []
+        for r in reversed(rows[-NGU_CANH_TIN:]):
+            if mid and str(r.get("external_message_id") or "") == mid:
+                continue
+            u = _voice_url_of(r)
+            if u and u not in own and u not in urls:
+                urls.append(u)
+        out, hear, left, heard = {}, _hear_for(cfg), float(GROUP_VOICE_SECONDS), 0
+        for u in urls:
+            cached = zalo_voice_history.cached_text(u)
+            if cached:
+                out[u] = cached
+        for u in urls[:GROUP_VOICE_MAX]:
+            if u in out or hear is None or left <= 5 or heard >= GROUP_VOICE_MAX:
+                continue
+            heard += 1
+            t0 = time.monotonic()
+
+            async def _one(url=u):
+                import tempfile
+                with tempfile.TemporaryDirectory(prefix="javis-gvoice-") as d:
+                    saved, _why = await zalo_attachments.fetch_file({"url": url, "name": "voice.m4a"}, Path(d), AUDIO_MAX_BYTES)
+                    if not saved:
+                        return ""
+                    res = await hear(Path(saved).read_bytes(), Path(saved).name)
+                return str((res or {}).get("text") or "").strip() if (res or {}).get("ok") else ""
+            try:
+                text = await asyncio.wait_for(_one(), left)
+            except Exception as e:      # noqa: BLE001 - an unheard voice message must never cost the reply
+                print(f"[chatbot] group voice not heard: {type(e).__name__}", file=sys.stderr)
+                text = ""
+            left -= time.monotonic() - t0
+            if text:
+                out[u] = text
+                zalo_voice_history.remember(u, text)
+        return out
+    except Exception as e:      # noqa: BLE001
+        print(f"[chatbot] group voices failed: {type(e).__name__}: {e}", file=sys.stderr)
+        return {}
+
+
 def ngu_canh_nhom(meta: dict, kenh: str, tai_khoan: str) -> str:
     """Khối chữ gồm tối đa `NGU_CANH_TIN` tin ngay trước tin đang hỏi trong NHÓM, hoặc "" (chat riêng, hết tin, lỗi kho).
 
@@ -787,9 +873,11 @@ def ngu_canh_nhom(meta: dict, kenh: str, tai_khoan: str) -> str:
     elif msgs and msgs[-1].get("sender_type") == "customer":
         msgs = msgs[:-1]       # không biết id tin: tin cuối là tin khách vừa ghi, chính là tin đang hỏi
     msgs = msgs[-NGU_CANH_TIN:]
+    voices = m.get("_group_voices") if isinstance(m.get("_group_voices"), dict) else {}
     dong = []
     for x in msgs:
-        chu = chatbot_reply_policy.clean_chat_text(x.get("text"), NGU_CANH_CHU + 1)
+        voice = _voice_line(x, voices)
+        chu = voice or chatbot_reply_policy.clean_chat_text(x.get("text"), NGU_CANH_CHU + 1)
         if not chu:
             continue
         if len(chu) > NGU_CANH_CHU:
@@ -2282,6 +2370,8 @@ def _make_answer_fn(bot_id: str):
         cfg["_tu_dong"] = tu_dong
         cfg["_bao_chu"] = chatbot_tu_dong.private_escalation(cfg, meta or {})
         cfg["_zalo_labels"] = list((meta or {}).get("zalo_labels") or [])
+        if isinstance(meta, dict):
+            meta["_group_voices"] = await hear_group_voices(meta, kenh_luot, aid_luot, cfg)
         cfg["_ngu_canh_nhom"] = ngu_canh_nhom(meta, kenh_luot, aid_luot)
         cfg["_customer_profile"] = customer_profile(cfg, meta)
         cfg["_ngu_canh_plugin"] = await plugin_context(cfg, meta or {}, kenh_luot, aid_luot)
@@ -2669,6 +2759,7 @@ async def manual_answer(conv: dict, msgs: list, draft: bool = False, instruction
         text = chu_khach or lenh
         _aid, kenh = _tai_khoan_cua(cfg, meta)
         cfg["_kenh_luot"], cfg["_tu_dong"] = kenh, False
+        meta["_group_voices"] = await hear_group_voices(meta, kenh, _aid, cfg)
         cfg["_ngu_canh_nhom"] = ngu_canh_nhom(meta, kenh, _aid)
         cfg["_customer_profile"] = customer_profile(cfg, meta)
         text_engine = text
@@ -2988,6 +3079,7 @@ async def try_message(bot_id: str, text: str, chat_type: str = "private", mentio
                 print(f"[chatbot {bot_id}] đọc phiên cho lượt thử lỗi: {type(e).__name__}", file=sys.stderr)
         cfg["_tai_lieu"], cfg["_kenh_luot"], cfg["_tu_dong"] = tl, kenh, chatbot_tu_dong.can_danh_gia(cfg, meta)
         cfg["_bao_chu"] = chatbot_tu_dong.private_escalation(cfg, meta)
+        meta["_group_voices"] = await hear_group_voices(meta, kenh, aid, cfg)
         cfg["_ngu_canh_nhom"] = ngu_canh_nhom(meta, kenh, aid)
         cfg["_customer_profile"] = customer_profile(cfg, meta)
         cfg["_ngu_canh_plugin"] = await plugin_context(cfg, meta, kenh, aid, trial=True)

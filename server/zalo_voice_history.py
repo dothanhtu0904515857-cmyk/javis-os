@@ -64,6 +64,22 @@ def _save(d: dict) -> None:
         print(f"[zalo voice] cache: {e}", file=sys.stderr)
 
 
+def cached_text(url: str) -> str:
+    """The transcript already heard for this link, or "" (shared with the group-context hearing in chatbot_runtime)."""
+    with _lock:
+        return str((_load().get(url) or {}).get("text") or "")
+
+
+def remember(url: str, text: str) -> None:
+    """Keep a transcript for a link so the next turn does not hear the same voice message again."""
+    if not url or not text:
+        return
+    with _lock:
+        d = _load()
+        d[url] = {"text": text, "ts": time.time()}
+        _save(d)
+
+
 def voice_url(msg: dict) -> str:
     """The `.aac` link of a voice message, or "" when `msg` is not one (or the link is not Zalo's CDN)."""
     if not isinstance(msg, dict):
