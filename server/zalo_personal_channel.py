@@ -1139,6 +1139,18 @@ def mo_ta_loi(raw: str, cap: int = 300) -> str:
 
 async def _vong() -> None:
     print("[zalo-personal] vòng đọc bắt đầu", file=sys.stderr)
+    try:        # voice messages that play in the chat: re-add the tool an update may have wiped (zalo_voice_tool.py)
+        import config as _cfg
+        import zalo_voice_tool
+        for f in zalo_voice_tool.ensure(_cfg.STATE_DIR):
+            print(f"[zalo-personal] added zalo_send_voice to {f}", file=sys.stderr)
+    except Exception:       # noqa: BLE001
+        pass
+    try:        # load the VieNeu voice model now, so the first voice reply does not wait for it
+        import voice_offline
+        voice_offline.warm_soon()
+    except Exception:       # noqa: BLE001
+        pass
     while not _stop:
         if _WAKE is not None:
             _WAKE.clear()       # before the pass: whatever calls wake() from here on is seen by the next sleep
@@ -2025,7 +2037,8 @@ def _own_echo(conn_id: str, ev: dict, msg: Any = None, blind: bool = True) -> bo
     thread = ev["external_chat_id"]
     if _la_tieng_vong(conn_id, thread, ev["text"]):
         _is_link_echo(conn_id, thread, ev, msg, blind=False)    # its card record too
-    elif not ((ev.get("message_type") == "image" and _la_vong_anh(conn_id, thread))
+    elif not ((ev.get("message_type") in ("image", "file")       # the bot's voice reply goes out as an mp3 file
+               and _la_vong_anh(conn_id, thread))
               or _is_link_echo(conn_id, thread, ev, msg, blind=blind)):
         return False
     attach_echo_id(conn_id, ev)

@@ -1175,6 +1175,7 @@ def _ly_do_im_co_ban(bot_cfg: dict, meta: dict) -> str:
     cho phép" là việc của CHỦ và phải nổi lên trang Chatbot, còn "không ai gọi tên" là hành vi
     đúng và phải im tuyệt đối.
     """
+    bot_cfg = chatbot_store.with_group_mode(bot_cfg, meta)      # this group's own reply mode, when the owner set one
     loai = str((meta or {}).get("chat_type") or "private")
     # The owner switched the bot off in this one chat (Chatbot v5, `blocked`): silent, and nothing to approve.
     if chatbot_store._in_list((bot_cfg or {}).get("blocked"), (meta or {}).get("chat_id")):
@@ -1490,6 +1491,7 @@ class PolicyHooks:
         cfg = chatbot_store.get_bot(self.bot_id)
         if not cfg or not _rp_is_group(meta) or not _nhom_duoc_phep(cfg, (meta or {}).get("chat_id")):
             return None
+        cfg = chatbot_store.with_group_mode(cfg, meta)
         rpc = chatbot_reply_policy.normalize_config(cfg.get("reply_policy"))
         if cfg.get("reply_when") != "auto":
             rpc = dict(rpc, mode="off")      # chỉ có nghĩa ở chế độ Tự đánh giá
@@ -1552,6 +1554,7 @@ class PolicyHooks:
     def replied(self, meta: dict, text: str) -> None:
         """Bot vừa nói trong nhóm: nhớ để nhận ra tin nối tiếp của đúng người được trả lời."""
         cfg = chatbot_store.get_bot(self.bot_id)
+        cfg = chatbot_store.with_group_mode(cfg, meta) if cfg else cfg
         if not cfg or cfg.get("reply_when") != "auto":
             return
         chatbot_reply_policy.note_bot_reply(self.bot_id, str((meta or {}).get("chat_id") or ""),
@@ -1581,6 +1584,7 @@ def _make_precheck_fn(bot_id: str):
         if not cfg:
             return {}
         meta = _rp_named_meta(cfg, text, meta)      # gọi tên trơn ("nhi mai ơi") cũng là gọi bot
+        cfg = chatbot_store.with_group_mode(cfg, meta)
         _nho_neu_khong_goi(bot_id, cfg, meta, text)
         ly_do = _ly_do_im(cfg, meta or {})
         if not ly_do:
@@ -1588,6 +1592,11 @@ def _make_precheck_fn(bot_id: str):
         if (meta or {}).get("member_join"):
             # A join in a group the bot may not speak in: silent, and not a "call" for the approval queue.
             return {}
+        if ly_do != "khong_goi_ten":
+            # Silence the owner may need to explain ("why did the bot not answer"): the code is logged, never the
+            # message. "khong_goi_ten" is normal group chatter and would flood the log.
+            print(f"[chatbot {bot_id}] im lặng ở {(meta or {}).get('chat_type') or 'private'} "
+                  f"…{str((meta or {}).get('chat_id') or '')[-6:]}: {ly_do}", file=sys.stderr)
         if ly_do in ("ngoai_gio_truc", "chat_tat"):
             # Outside active hours, or the owner switched the bot off in this chat (Chatbot v5): silent, nothing sent. A message the bot WOULD have answered still goes to the
             # inbox so whoever is on duty reads it in the morning; group chatter in "Tự đánh giá" mode does not,
